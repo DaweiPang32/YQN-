@@ -269,7 +269,12 @@ def load_pallet_detail_df():
             "运单清单_list": wbs
         })
 
-    base = df.groupby(["托盘号","仓库代码"], dropna=False).apply(_agg_group).reset_index()
+    base = (
+    df.groupby(["托盘号", "仓库代码"], dropna=False, group_keys=False)
+      .apply(_agg_group)
+      .reset_index(drop=True)  # 避免重复插入分组列
+)
+
 
     # 与到仓表合并（ETA/ATA 合并列、ETD/ATD、承诺）
     arrivals = load_arrivals_df()
