@@ -1,6 +1,7 @@
-streamlit>=1.36
-gspread>=6
-google-auth>=2.30
-pandas>=2.2.2
+streamlit==1.36.0
+pandas==2.2.2
 numpy==1.26.4
-pyarrow>=14,<15
+pyarrow==14.0.2
+gspread==6.0.0
+google-auth==2.33.0
+python-dateutil==2.9.0.post0
