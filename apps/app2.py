@@ -201,6 +201,7 @@ def load_pallet_detail_df():
     托盘维度：从《托盘明细表》聚合，并与《到仓数据表》匹配时间/承诺字段
     - 托盘重量：仅来自托盘明细，按托盘求和
     - 托盘体积（CBM）：由 L/W/H(inch) 计算（每个托盘仅计算一次体积，取该托盘组内第一组有效 L/W/H）
+    - 同时输出每托盘的“长(in)/宽(in)/高(in)”（各取首个有效值，仅用于显示）
     - ETA/ATA 使用“合并列”（来自到仓表），展示为 'ETA/ATA yyyy-mm-dd'
     """
     ws = client.open(SHEET_PALLET_DETAIL).sheet1
@@ -278,17 +279,30 @@ def load_pallet_detail_df():
         s_num = pd.to_numeric(s, errors="coerce").dropna()
         return float(s_num.iloc[0]) if len(s_num) > 0 else None
 
+    def _first_valid_num(s):
+        s_num = pd.to_numeric(s, errors="coerce").dropna()
+        return float(s_num.iloc[0]) if len(s_num) > 0 else None
+
     def _wb_list(s):
         vals = [x for x in s if isinstance(x, str) and x.strip()]
         return vals
 
+    # 动态构造聚合字典
+    agg_dict = {
+        "托盘重量": (weight_col, lambda s: pd.to_numeric(s, errors="coerce").dropna().sum()),
+        "托盘体积": ("_cbm_row", _first_valid),  # 每托盘仅取第一条有效体积
+        "运单清单_list": ("运单号", _wb_list),
+    }
+    if len_col:
+        agg_dict["托盘长in"] = (len_col, _first_valid_num)
+    if wid_col:
+        agg_dict["托盘宽in"] = (wid_col, _first_valid_num)
+    if hei_col:
+        agg_dict["托盘高in"] = (hei_col, _first_valid_num)
+
     base = (
         df.groupby(["托盘号", "仓库代码"], as_index=False, dropna=False)
-          .agg(
-              托盘重量=(weight_col, lambda s: pd.to_numeric(s, errors="coerce").dropna().sum()),
-              托盘体积=("_cbm_row", _first_valid),  # 每托盘仅取第一条有效体积
-              运单清单_list=("运单号", _wb_list),
-          )
+          .agg(**agg_dict)
     )
 
     # 与到仓数据合并以生成展示字符串
@@ -338,11 +352,19 @@ def load_pallet_detail_df():
                     return 10**9
             diff_days_str = sorted(diffs_days, key=keyfn)[0]
 
+        # 加入 L/W/H（四舍五入到 2 位，仅显示）
+        L_in = brow.get("托盘长in", None)
+        W_in = brow.get("托盘宽in", None)
+        H_in = brow.get("托盘高in", None)
+
         pallets.append({
             "托盘号": pid,
             "仓库代码": wh,
             "托盘重量": float(p_wt) if pd.notna(p_wt) else None,
             "托盘体积": float(p_vol) if p_vol is not None else None,  # m³
+            "长(in)": round(float(L_in), 2) if pd.notna(L_in) else None,
+            "宽(in)": round(float(W_in), 2) if pd.notna(W_in) else None,
+            "高(in)": round(float(H_in), 2) if pd.notna(H_in) else None,
             "运单数量": len(waybills),
             "运单清单": ", ".join(waybills) if waybills else "",
             "对客承诺送仓时间": promised_str,
@@ -752,7 +774,8 @@ if wh_pick != "（全部）":
 
 # 表格与勾选
 show_cols = [
-    "托盘号","仓库代码","托盘重量","托盘体积","运单数量","运单清单",
+    "托盘号","仓库代码","托盘重量","长(in)","宽(in)","高(in)","托盘体积",
+    "运单数量","运单清单",
     "对客承诺送仓时间","送仓时段差值(天)",
     "ETA/ATA(按运单)","ETD/ATD(按运单)"
 ]
@@ -761,7 +784,14 @@ for c in show_cols:
         pallet_df[c] = ""
 
 disp_df = pallet_df.copy().reset_index(drop=True)
-disp_df["托盘体积"] = pd.to_numeric(disp_df["托盘体积"], errors="coerce").round(2)
+for c in ["托盘体积","托盘重量","长(in)","宽(in)","高(in)"]:
+    disp_df[c] = pd.to_numeric(disp_df.get(c, pd.Series()), errors="coerce")
+
+disp_df["托盘体积"] = disp_df["托盘体积"].round(2)
+disp_df["长(in)"] = disp_df["长(in)"].round(2)
+disp_df["宽(in)"] = disp_df["宽(in)"].round(2)
+disp_df["高(in)"] = disp_df["高(in)"].round(2)
+
 
 disp_df["选择"] = False
 edited_pal = st.data_editor(
@@ -826,7 +856,8 @@ upload_df["总费用"] = upload_df["总费用"].map(lambda x: f"{x:.2f}")
 upload_df["托盘体积"] = pd.to_numeric(upload_df.get("托盘体积", pd.Series()), errors="coerce").round(2)
 
 preview_cols_pal = [
-    "卡车单号","仓库代码","托盘号","托盘重量","托盘体积","运单数量","运单清单",
+    "卡车单号","仓库代码","托盘号","托盘重量","长(in)","宽(in)","高(in)","托盘体积",
+    "运单数量","运单清单",
     "对客承诺送仓时间","送仓时段差值(天)",
     "ETA/ATA(按运单)","ETD/ATD(按运单)",
     "分摊比例","分摊费用","总费用"
