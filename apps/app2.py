@@ -311,14 +311,26 @@ def load_pallet_detail_df():
         arrivals[["运单号", "ETA/ATA", "ETD/ATD", "对客承诺送仓时间", "_ETAATA_date"]],
         on="运单号", how="left"
     )
-
+    bol_cust_df = load_bol_waybill_costs()
+    cust_map = {}
+    if not bol_cust_df.empty and "运单号" in bol_cust_df.columns and "客户单号" in bol_cust_df.columns:
+        # 仅使用自提明细来源（用户要求）
+        for _, rr in bol_cust_df.iterrows():
+            wb = _norm_waybill_str(rr.get("运单号", ""))
+            cust = str(rr.get("客户单号", "")).strip()
+            if wb and cust:
+                cust_map[wb] = cust
     pallets = []
     for _, brow in base.iterrows():
         pid, wh = brow["托盘号"], brow["仓库代码"]
         p_wt = brow.get("托盘重量", None)
         p_vol = brow.get("托盘体积", None)
         waybills = brow.get("运单清单_list", []) or []
-
+        waybills_disp = []
+        for wb in waybills:
+            wb_norm = _norm_waybill_str(wb)
+            cust = cust_map.get(wb_norm, "")
+            waybills_disp.append(f"{wb}({cust})" if cust else f"{wb}")
         sub = df_join[(df_join["托盘号"] == pid) & (df_join["仓库代码"] == wh)]
 
         lines_etaata, lines_etdatd, promised = [], [], []
@@ -366,7 +378,7 @@ def load_pallet_detail_df():
             "宽(in)": round(float(W_in), 2) if pd.notna(W_in) else None,
             "高(in)": round(float(H_in), 2) if pd.notna(H_in) else None,
             "运单数量": len(waybills),
-            "运单清单": ", ".join(waybills) if waybills else "",
+            "运单清单": ", ".join(waybills_disp) if waybills_disp else "",
             "对客承诺送仓时间": promised_str,
             "送仓时段差值(天)": diff_days_str,
             "ETA/ATA(按运单)": readable_etaata,
