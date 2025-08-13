@@ -5,11 +5,10 @@ import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import SpreadsheetNotFound
 from datetime import datetime, timedelta, date
-import random
-import string
-from uuid import uuid4
+import re
+import zlib
 
-
+# ========= Google 授权 =========
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
 def get_gspread_client():
@@ -25,13 +24,15 @@ def get_gspread_client():
 
 client = get_gspread_client()
 
-
 # ========= 表名配置 =========
 SHEET_ARRIVALS_NAME   = "到仓数据表"
 SHEET_SHIP_DETAIL     = "bol自提明细"    # 发货app追加的源，作为收货展示主数据
 SHEET_PALLET_DETAIL   = "托盘明细表"      # 收货端上传目标表（追加）
 
-# ========= 工具函数 =========
+# ========= 唯一ID注册表配置（用于绝对唯一的托盘号）=========
+SHEET_PALLET_REGISTRY_TITLE = "托盘号注册表"  # 建议固定放到 st.secrets["pallet_registry_key"]
+
+# ========= 小工具 =========
 def excel_serial_to_date(val):
     """把 Excel 数字日期(如 45857) 转为 datetime；非法返回 NaT"""
     try:
@@ -40,8 +41,87 @@ def excel_serial_to_date(val):
     except Exception:
         return pd.NaT
 
-def generate_pallet_id():
-    return "P" + ''.join(random.choices(string.digits, k=3))
+ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+def _to_base36(n: int) -> str:
+    if n == 0:
+        return '0'
+    s = []
+    while n:
+        n, r = divmod(n, 36)
+        s.append(ALPHABET[r])
+    return ''.join(reversed(s))
+
+def get_pallet_registry_ws():
+    """
+    返回‘托盘号注册表’的 sheet1。不存在则创建并写表头。
+    优先用 key 打开（放在 st.secrets["pallet_registry_key"]），避免重名带来的歧义。
+    """
+    key = ""
+    try:
+        key = st.secrets.get("pallet_registry_key", "").strip()
+    except Exception:
+        key = ""
+    try:
+        if key:
+            ss = client.open_by_key(key)
+        else:
+            ss = client.open(SHEET_PALLET_REGISTRY_TITLE)
+    except SpreadsheetNotFound:
+        ss = client.create(SHEET_PALLET_REGISTRY_TITLE)
+        # 创建后可在 Google Sheets 中手动共享给其他需要写入的服务账号
+    ws = ss.sheet1
+    # 如果是一个全新表，写入表头
+    if not ws.get_all_values():
+        ws.update([["ts_iso", "warehouse", "note"]])
+    return ws
+
+def allocate_unique_seq(warehouse: str | None) -> int:
+    """
+    通过向注册表 append 一行来获取一个唯一的行号。
+    Google Sheets 的 append 是原子追加：并发时每次都会拿到不同的行号。
+    """
+    ws = get_pallet_registry_ws()
+    resp = ws.append_row(
+        [datetime.utcnow().isoformat(), (warehouse or "").upper(), ""],
+        value_input_option="RAW",
+        insert_data_option="INSERT_ROWS",
+        table_range="A1",
+        include_values_in_response=True,
+    )
+    updated_range = (resp or {}).get("updates", {}).get("updatedRange", "")
+    # 形如 "Sheet1!A42:C42" → 提取 42
+    m = re.search(r"![A-Z]+(\d+):", updated_range)
+    if m:
+        return int(m.group(1))
+    # 兜底（极少发生）：用当前已用数据行数作为序列
+    try:
+        used = len(ws.get_all_values())
+        return max(used, 2)  # 至少从第2行起（第1行为表头）
+    except Exception:
+        return int(datetime.utcnow().timestamp())
+
+def generate_pallet_id(warehouse: str | None = None) -> str:
+    """
+    PYYMMDD-WHH-SEQ36-C
+    - YYMMDD：当前日期
+    - WHH   ：仓库前三位（不足补 UNK）
+    - SEQ36 ：注册表行号的 base36（定长6位，足够千万级行号；如需更大可改7/8位）
+    - C     ：CRC32 校验位（单字符）
+    """
+    wh = (str(warehouse) if warehouse else "UNK").upper()[:3] or "UNK"
+    ts = datetime.now().strftime("%y%m%d")
+
+    try:
+        seq = allocate_unique_seq(wh)
+    except Exception:
+        # 注册表临时异常时，退化到时间戳方案（仍然极低概率重复，但不算“数学上的绝对”）
+        seq = int(datetime.utcnow().timestamp() * 10_000)
+
+    seq36 = _to_base36(seq).rjust(6, '0')
+    core = f"P{ts}-{wh}-{seq36}"
+    check = ALPHABET[zlib.crc32(core.encode()) % 36]
+    return f"{core}-{check}"
 
 # ========= 缓存读取 =========
 @st.cache_data(ttl=60)
@@ -107,9 +187,55 @@ def load_arrivals_df():
 
     return df[["运单号", "仓库代码", "箱数"]]
 
+def load_uploaded_allocations(warehouse: str) -> dict:
+    """
+    从《托盘明细表》中汇总：同仓库下每个运单号已上传的“箱数”总和。
+    返回 {运单号: 已上传箱数}
+    """
+    try:
+        ss = client.open(SHEET_PALLET_DETAIL)
+        sheet = ss.sheet1
+    except SpreadsheetNotFound:
+        return {}
+
+    values = sheet.get_all_values()
+    if not values:
+        return {}
+
+    header = values[0]
+    rows = values[1:]
+
+    def col_idx(name: str, default=None):
+        try:
+            return header.index(name)
+        except ValueError:
+            return default
+
+    idx_wh = col_idx("仓库代码")
+    idx_wb = col_idx("运单号")
+    idx_qty = col_idx("箱数")
+
+    if idx_wb is None or idx_qty is None:
+        return {}
+
+    agg = {}
+    for r in rows:
+        if idx_wh is not None and len(r) > idx_wh:
+            if str(r[idx_wh]).strip() != str(warehouse).strip():
+                continue
+        if len(r) <= idx_wb or len(r) <= idx_qty:
+            continue
+        wb = str(r[idx_wb]).strip()
+        if not wb:
+            continue
+        qty = pd.to_numeric(r[idx_qty], errors="coerce")
+        if pd.isna(qty):
+            qty = 0
+        agg[wb] = agg.get(wb, 0) + int(qty)
+    return agg
+
 # ========= 页面设置 =========
 st.set_page_config(page_title="物流收货平台（基于发货明细）", layout="wide")
-
 st.title("📦 BCF 收货托盘绑定（数据源：bol自提明细 + 到仓箱数）")
 
 # ========= 刷新缓存 =========
@@ -179,9 +305,11 @@ st.dataframe(filtered_df, use_container_width=True, height=320)
 # ========== 托盘绑定逻辑 ==========
 st.markdown("### 🧰 托盘操作")
 if st.button("➕ 新建托盘"):
-    new_pallet = generate_pallet_id()
+    # 通过注册表拿到绝对唯一的托盘号（包含日期/仓库/序列号/校验位）
+    new_pallet = generate_pallet_id(warehouse)
+    # 正常情况下不会重复；以下 while 是额外保护（几乎不会触发）
     while new_pallet in st.session_state["all_pallets"]:
-        new_pallet = generate_pallet_id()
+        new_pallet = generate_pallet_id(warehouse)
     st.session_state["all_pallets"].append(new_pallet)
 
 for pallet_id in list(st.session_state["all_pallets"]):
@@ -216,46 +344,106 @@ for pallet_id in list(st.session_state["all_pallets"]):
             entries.append((wb, qty))
 
         if st.button(f"🚀 确认绑定托盘 {pallet_id}"):
-            is_merged = len(entries) > 1
-            detail_type = "并板托盘" if is_merged else "普通托盘"
-
+            # 1) 本次输入：按运单汇总箱数（同一运单可被选多次）
+            grouped_entries = {}
             for wb, qty in entries:
-                row = filtered_df[filtered_df["运单号"] == wb].iloc[0]
-                rid = f"{pallet_id}-{uuid4().hex[:6]}"
-                record = {
-                    "托盘号": pallet_id,
-                    "仓库代码": warehouse,
-                    "运单号": wb,
-                    "客户单号": row.get("客户单号", ""),
-                    "箱数": qty,
-                    "重量": weight,
-                    "长": length,
-                    "宽": width,
-                    "高": height,
-                    "ETA(到BCF)": row.get("ETA(到BCF)", ""),
-                    "类型": detail_type
-                }
-                st.session_state["pallet_detail_records"].append(record)
+                wb = str(wb).strip()
+                grouped_entries[wb] = grouped_entries.get(wb, 0) + int(qty)
 
-            st.success(f"✅ 托盘 {pallet_id} 绑定完成（{detail_type}）")
-            st.session_state["all_pallets"].remove(pallet_id)
+            # 2) 到仓总箱数（只看当前仓库已过滤后的表）
+            allowed_map = (
+                filtered_df
+                .assign(箱数=pd.to_numeric(filtered_df["箱数"], errors="coerce"))
+                .groupby("运单号", as_index=True)["箱数"].first()
+                .to_dict()
+            )
+
+            # 3) 本地已分配（未上传）的同仓库同运单已绑定箱数
+            allocated_local = {}
+            for r in st.session_state.get("pallet_detail_records", []):
+                if r.get("仓库代码") != warehouse:
+                    continue
+                wb2 = str(r.get("运单号", "")).strip()
+                if not wb2:
+                    continue
+                allocated_local[wb2] = allocated_local.get(wb2, 0) + int(pd.to_numeric(r.get("箱数", 0), errors="coerce") or 0)
+
+            # 4) 已上传的同仓库同运单已绑定箱数（读《托盘明细表》）
+            allocated_uploaded = load_uploaded_allocations(warehouse)
+
+            # 5) 合并“已分配”映射
+            allocated_map = {}
+            for wb, v in allocated_uploaded.items():
+                allocated_map[wb] = allocated_map.get(wb, 0) + int(v)
+            for wb, v in allocated_local.items():
+                allocated_map[wb] = allocated_map.get(wb, 0) + int(v)
+
+            # 6) 校验是否超出
+            violations = []
+            missing_info = []
+            for wb, add_qty in grouped_entries.items():
+                allowed = allowed_map.get(wb, None)
+                if allowed is None or pd.isna(allowed):
+                    # 到仓表没有该单的箱数，无法做对比 → 提示（如需强制阻断，可把它加入 violations）
+                    missing_info.append(wb)
+                    continue
+
+                already = allocated_map.get(wb, 0)
+                total_after = already + int(add_qty)
+                if total_after > int(allowed):
+                    violations.append({
+                        "运单号": wb,
+                        "到仓箱数": int(allowed),
+                        "已分配(已上传+本地)": int(already),
+                        "本次输入": int(add_qty),
+                        "超出": int(total_after - int(allowed)),
+                    })
+
+            if missing_info:
+                st.warning("以下运单在『到仓数据表』未找到有效箱数，跳过校验：{}".format(", ".join(missing_info)))
+
+            if violations:
+                st.error("❌ 有运单本次输入箱数超出『到仓数据表』总箱数，请调整后再提交。")
+                st.dataframe(pd.DataFrame(violations), use_container_width=True)
+            else:
+                # 7) 通过校验 → 写入本地暂存
+                is_merged = len(entries) > 1
+                detail_type = "并板托盘" if is_merged else "普通托盘"
+
+                for wb, qty in entries:
+                    row = filtered_df[filtered_df["运单号"] == wb].iloc[0]
+                    record = {
+                        "托盘号": pallet_id,
+                        "仓库代码": warehouse,
+                        "运单号": wb,
+                        "客户单号": row.get("客户单号", ""),
+                        "箱数": qty,
+                        "重量": weight,
+                        "长": length,
+                        "宽": width,
+                        "高": height,
+                        "ETA(到BCF)": row.get("ETA(到BCF)", ""),
+                        "类型": detail_type
+                    }
+                    st.session_state["pallet_detail_records"].append(record)
+
+                st.success(f"✅ 托盘 {pallet_id} 绑定完成（{detail_type}）")
+                st.session_state["all_pallets"].remove(pallet_id)
 
 # ======= SUBMIT 按钮放大加粗高亮样式 =======
 st.markdown("""
     <style>
-    /* 针对上传区的 SUBMIT 按钮放大 + 高亮 */
     div.stButton > button[kind="secondary"] {
-        font-size: 28px !important;      /* 字体很大 */
-        font-weight: 900 !important;     /* 加粗 */
-        padding: 0.8em 1.6em !important; /* 内边距大一点 */
-        background-color: #ff9800 !important; /* 醒目橙色背景 */
-        color: white !important;         /* 白色文字 */
-        border-radius: 10px !important;  /* 圆角 */
-        border: 3px solid #e65100 !important; /* 深色边框 */
+        font-size: 28px !important;
+        font-weight: 900 !important;
+        padding: 0.8em 1.6em !important;
+        background-color: #ff9800 !important;
+        color: white !important;
+        border-radius: 10px !important;
+        border: 3px solid #e65100 !important;
     }
     </style>
 """, unsafe_allow_html=True)
-
 
 # ========== 展示与编辑托盘明细（本地内存，可删除/自动保存编辑）==========
 if st.session_state["pallet_detail_records"]:
