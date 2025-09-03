@@ -304,23 +304,48 @@ st.dataframe(filtered_df, use_container_width=True, height=320)
 
 # ========== 托盘绑定逻辑 ==========
 st.markdown("### 🧰 托盘操作")
-if st.button("➕ 新建托盘"):
-    # 通过注册表拿到绝对唯一的托盘号（包含日期/仓库/序列号/校验位）
-    new_pallet = generate_pallet_id(warehouse)
-    # 正常情况下不会重复；以下 while 是额外保护（几乎不会触发）
-    while new_pallet in st.session_state["all_pallets"]:
-        new_pallet = generate_pallet_id(warehouse)
-    st.session_state["all_pallets"].append(new_pallet)
 
+# 对齐的工具栏：单个新建、批量数量、批量新建
+col1, col2, col3, _sp = st.columns([1, 1, 1, 6])
+
+with col1:
+    st.write(" ")
+    if st.button("➕ 新建托盘", key="create_one_pallet", use_container_width=True):
+        new_pallet = generate_pallet_id(warehouse)
+        tries = 0
+        while new_pallet in st.session_state["all_pallets"] and tries < 5:
+            new_pallet = generate_pallet_id(warehouse)
+            tries += 1
+        st.session_state["all_pallets"].append(new_pallet)
+        st.success(f"已新建托盘：{new_pallet}")
+
+with col2:
+    bulk_n = st.number_input(
+        "批量数量",
+        min_value=1, max_value=200, step=1, value=5,
+        key="bulk_new_pallets_count"
+    )
+
+with col3:
+    st.write(" ")
+    if st.button("🧩 批量新建托盘", key="create_bulk_pallets", use_container_width=True):
+        created = []
+        existing = set(st.session_state["all_pallets"])
+        for _ in range(int(bulk_n)):
+            p = generate_pallet_id(warehouse)
+            tries = 0
+            while (p in existing or p in created) and tries < 8:
+                p = generate_pallet_id(warehouse)
+                tries += 1
+            created.append(p)
+        st.session_state["all_pallets"].extend(created)
+        st.success(f"✅ 批量新建完成，共 {len(created)} 个：{', '.join(created[:5])}{' ...' if len(created)>5 else ''}")
+
+# 每个托盘的操作区
 for pallet_id in list(st.session_state["all_pallets"]):
     with st.expander(f"📦 托盘 {pallet_id} 操作区", expanded=True):
         st.markdown(f"🚚 当前托盘号：**{pallet_id}**")
         waybills = filtered_df["运单号"].dropna().unique()
-
-        num_entries = st.number_input(
-            f"添加运单数量 - 托盘 {pallet_id}",
-            min_value=1, step=1, value=1, key=f"num_{pallet_id}"
-        )
 
         st.markdown("#### 📦 托盘整体尺寸（统一填写一次）")
         pallet_cols = st.columns(4)
@@ -333,62 +358,149 @@ for pallet_id in list(st.session_state["all_pallets"]):
         with pallet_cols[3]:
             height = st.number_input("托盘高",  min_value=0.0, key=f"height_{pallet_id}")
 
-        st.markdown("#### 📦 运单明细（每单单独填写箱数）")
+        # ===== 录入运单（两种方式）=====
+        st.markdown("#### 📦 运单明细（选择一种方式录入）")
+        tab_paste, tab_manual = st.tabs(["🧷 粘贴运单列表（推荐）", "🖱️ 逐条选择"])
+
+        # === 公共：可分配/到仓 映射，用于默认值与提示 ===
+        allowed_map = (
+            filtered_df.assign(箱数=pd.to_numeric(filtered_df["箱数"], errors="coerce"))
+                      .groupby("运单号", as_index=True)["箱数"].max()   # 用 max 更稳
+                      .to_dict()
+        )
+        # 已分配-本地
+        allocated_local = {}
+        for r in st.session_state.get("pallet_detail_records", []):
+            if r.get("仓库代码") != warehouse:
+                continue
+            wb2 = str(r.get("运单号", "")).strip()
+            if not wb2:
+                continue
+            allocated_local[wb2] = allocated_local.get(wb2, 0) + int(pd.to_numeric(r.get("箱数", 0), errors="coerce") or 0)
+        # 已分配-已上传
+        allocated_uploaded = load_uploaded_allocations(warehouse)
+        allocated_map = {}
+        for wb_, v in allocated_uploaded.items():
+            allocated_map[wb_] = allocated_map.get(wb_, 0) + int(v)
+        for wb_, v in allocated_local.items():
+            allocated_map[wb_] = allocated_map.get(wb_, 0) + int(v)
+        remaining_map = {wb_: int(allowed_map.get(wb_, 0)) - int(allocated_map.get(wb_, 0)) for wb_ in allowed_map}
+
+        # 占位：手动选择 entries（供确认按钮兜底）
         entries = []
-        for i in range(num_entries):
-            cols = st.columns([3, 1])
-            with cols[0]:
-                wb = st.selectbox(f"运单号 {i+1}", waybills, key=f"wb_{pallet_id}_{i}")
-            with cols[1]:
-                qty = st.number_input("箱数", min_value=1, key=f"qty_{pallet_id}_{i}")
-            entries.append((wb, qty))
 
-        if st.button(f"🚀 确认绑定托盘 {pallet_id}"):
-            # 1) 本次输入：按运单汇总箱数（同一运单可被选多次）
-            grouped_entries = {}
-            for wb, qty in entries:
-                wb = str(wb).strip()
-                grouped_entries[wb] = grouped_entries.get(wb, 0) + int(qty)
-
-            # 2) 到仓总箱数（只看当前仓库已过滤后的表）
-            allowed_map = (
-                filtered_df
-                .assign(箱数=pd.to_numeric(filtered_df["箱数"], errors="coerce"))
-                .groupby("运单号", as_index=True)["箱数"].first()
-                .to_dict()
+        # ===== 方式一：粘贴运单号 =====
+        with tab_paste:
+            st.caption("从 Excel 复制整列运单号，直接粘贴到下面（支持换行/逗号/制表符），会自动去重并过滤不在当前仓/日期范围内的运单。")
+            pasted = st.text_area(
+                "粘贴运单号",
+                key=f"pasted_wb_{pallet_id}",
+                height=120,
+                help="示例：\nUSSH2025...\nUSSH2025...\n或用逗号/制表符分隔"
             )
+            if st.button("🔎 解析运单", key=f"parse_wb_{pallet_id}"):
+                raw_tokens = re.split(r"[,\s\t\r\n]+", pasted.strip())
+                tokens = [t.strip() for t in raw_tokens if t.strip()]
+                valid_set = set(filtered_df["运单号"].dropna().astype(str))
 
-            # 3) 本地已分配（未上传）的同仓库同运单已绑定箱数
-            allocated_local = {}
-            for r in st.session_state.get("pallet_detail_records", []):
-                if r.get("仓库代码") != warehouse:
-                    continue
-                wb2 = str(r.get("运单号", "")).strip()
-                if not wb2:
-                    continue
-                allocated_local[wb2] = allocated_local.get(wb2, 0) + int(pd.to_numeric(r.get("箱数", 0), errors="coerce") or 0)
+                valid_list, seen = [], set()
+                for t in tokens:
+                    if t in valid_set and t not in seen:
+                        valid_list.append(t); seen.add(t)
+                invalid_list = [t for t in tokens if t not in valid_set]
 
-            # 4) 已上传的同仓库同运单已绑定箱数（读《托盘明细表》）
-            allocated_uploaded = load_uploaded_allocations(warehouse)
+                # 默认箱数 = 到仓“箱数”；可编辑
+                init_rows = []
+                for t in valid_list:
+                    allowed_qty = int(pd.to_numeric(allowed_map.get(t, 0), errors="coerce") or 0)
+                    rem = remaining_map.get(t)
+                    init_rows.append({
+                        "运单号": t,
+                        "箱数": allowed_qty if allowed_qty > 0 else 1,   # 默认值=到仓箱数
+                        "删除": False
+                    })
 
-            # 5) 合并“已分配”映射
-            allocated_map = {}
-            for wb, v in allocated_uploaded.items():
-                allocated_map[wb] = allocated_map.get(wb, 0) + int(v)
-            for wb, v in allocated_local.items():
-                allocated_map[wb] = allocated_map.get(wb, 0) + int(v)
+                df_init = pd.DataFrame(init_rows)
+                st.session_state[f"wb_rows_{pallet_id}"] = df_init
 
-            # 6) 校验是否超出
-            violations = []
-            missing_info = []
+                # 若默认值超过剩余，提示（提交仍会拦截）
+                try:
+                    exceed_mask = pd.to_numeric(df_init["箱数"], errors="coerce") > pd.to_numeric(df_init["可分配剩余"], errors="coerce")
+                    if exceed_mask.any():
+                        hit = df_init.loc[exceed_mask, "运单号"].tolist()
+                        st.warning(
+                            f"以下运单默认箱数已超过『可分配剩余』：{', '.join(hit[:6])}{' ...' if len(hit) > 6 else ''}。"
+                            "请在下方表格中调整，否则提交时会被拦截。"
+                        )
+                except Exception:
+                    pass
+
+                if invalid_list:
+                    st.warning(f"已忽略 {len(invalid_list)} 个未在当前仓/日期范围内的运单：{', '.join(invalid_list[:5])}{' ...' if len(invalid_list)>5 else ''}")
+                if not valid_list:
+                    st.info("未解析到有效的运单号，请检查粘贴内容或日期/仓库筛选。")
+
+            # 渲染可编辑表格
+            df_rows = st.session_state.get(f"wb_rows_{pallet_id}")
+            if df_rows is not None and not df_rows.empty:
+                edited_df = st.data_editor(
+                    df_rows,
+                    key=f"wb_editor_{pallet_id}",
+                    use_container_width=True,
+                    height=260,
+                    num_rows="dynamic",
+                    column_config={
+                        "运单号": st.column_config.TextColumn(disabled=True),
+                        "箱数": st.column_config.NumberColumn(step=1, min_value=1),  # 可改
+                        "删除": st.column_config.CheckboxColumn("删除"),
+                    },
+                )
+
+                st.session_state[f"wb_rows_{pallet_id}"] = edited_df
+
+        # ===== 方式二：逐条选择（保留）=====
+        with tab_manual:
+            num_entries = st.number_input(
+                f"添加运单数量 - 托盘 {pallet_id}",
+                min_value=1, step=1, value=1, key=f"num_{pallet_id}"
+            )
+            for i in range(num_entries):
+                cols = st.columns([3, 1])
+                with cols[0]:
+                    wb = st.selectbox(f"运单号 {i+1}", waybills, key=f"wb_{pallet_id}_{i}")
+                    rem = remaining_map.get(str(wb).strip())
+                    if rem is not None:
+                        st.caption(f"当前仓该单可分配剩余：**{max(rem,0)}** 箱")
+                with cols[1]:
+                    qty = st.number_input("箱数", min_value=1, key=f"qty_{pallet_id}_{i}")
+                entries.append((wb, qty))
+
+        # ===== 确认绑定（优先读取粘贴表格；否则用手动选择）=====
+        if st.button(f"🚀 确认绑定托盘 {pallet_id}"):
+            grouped_entries = {}
+
+            pasted_df = st.session_state.get(f"wb_rows_{pallet_id}")
+            if pasted_df is not None and not pasted_df.empty:
+                df_use = pasted_df[pasted_df.get("删除", False) == False].copy()
+                for _, r in df_use.iterrows():
+                    wb = str(r.get("运单号", "")).strip()
+                    qty = int(pd.to_numeric(r.get("箱数", 0), errors="coerce") or 0)
+                    if not wb or qty <= 0:
+                        continue
+                    grouped_entries[wb] = grouped_entries.get(wb, 0) + qty
+            else:
+                for wb, qty in entries:
+                    wb = str(wb).strip()
+                    grouped_entries[wb] = grouped_entries.get(wb, 0) + int(qty)
+
+            # 校验是否超出
+            violations, missing_info = [], []
             for wb, add_qty in grouped_entries.items():
                 allowed = allowed_map.get(wb, None)
                 if allowed is None or pd.isna(allowed):
-                    # 到仓表没有该单的箱数，无法做对比 → 提示（如需强制阻断，可把它加入 violations）
                     missing_info.append(wb)
                     continue
-
-                already = allocated_map.get(wb, 0)
+                already = int(allocated_map.get(wb, 0))
                 total_after = already + int(add_qty)
                 if total_after > int(allowed):
                     violations.append({
@@ -406,18 +518,21 @@ for pallet_id in list(st.session_state["all_pallets"]):
                 st.error("❌ 有运单本次输入箱数超出『到仓数据表』总箱数，请调整后再提交。")
                 st.dataframe(pd.DataFrame(violations), use_container_width=True)
             else:
-                # 7) 通过校验 → 写入本地暂存
-                is_merged = len(entries) > 1
+                # 并板判定：按“不同运单数”
+                is_merged = len([wb for wb, q in grouped_entries.items() if q > 0]) > 1
                 detail_type = "并板托盘" if is_merged else "普通托盘"
 
-                for wb, qty in entries:
+                # 写入本地暂存（同一运单只写一行；数量为合并后的）
+                for wb, qty in grouped_entries.items():
+                    if qty <= 0:
+                        continue
                     row = filtered_df[filtered_df["运单号"] == wb].iloc[0]
                     record = {
                         "托盘号": pallet_id,
                         "仓库代码": warehouse,
                         "运单号": wb,
                         "客户单号": row.get("客户单号", ""),
-                        "箱数": qty,
+                        "箱数": int(qty),
                         "重量": weight,
                         "长": length,
                         "宽": width,
