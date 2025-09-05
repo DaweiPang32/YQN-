@@ -140,7 +140,6 @@ def _split_waybill_list(s):
 
 # ========= 数据读取 =========
 @st.cache_data(ttl=60)
-@st.cache_data(ttl=60)
 def load_arrivals_df():
     ws = client.open(SHEET_ARRIVALS_NAME).sheet1
     data = ws.get_all_values(
