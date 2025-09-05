@@ -62,17 +62,44 @@ def get_ws(sheet_title: str, secret_key_name: str | None = None):
         ss = client.open(sheet_title)
     return ss.sheet1
 
-def _retry(fn, *args, _retries=5, _base=0.6, _factor=1.8, _max_sleep=6.0, **kwargs):
-    """指数退避重试：专治 429/5xx"""
+# ======== REPLACE: _retry（更稳健） ========
+from gspread.exceptions import APIError
+import time
+
+def _retry(fn, *args, _retries=6, _base=0.6, _factor=1.8, _max_sleep=6.0, **kwargs):
+    """
+    带指数退避的安全调用：
+    - 对 429/5xx 重试
+    - 对“未知/被脱敏”的 APIError 也尝试重试几次
+    - 最后一次仍失败则返回 None（由上层决定是否继续/提前结束）
+    """
+    last_exc = None
     for i in range(_retries):
         try:
             return fn(*args, **kwargs)
         except APIError as e:
-            code = getattr(e, "response", None).status_code if getattr(e, "response", None) else None
-            if code in (429, 500, 502, 503, 504):
+            last_exc = e
+            # 一些平台会把 status code 脱敏，这里尽量获取；拿不到也当作“可重试”
+            code = None
+            try:
+                if getattr(e, "response", None) is not None:
+                    code = getattr(e.response, "status_code", None)
+            except Exception:
+                code = None
+
+            if code in (429, 500, 502, 503, 504) or code is None:
                 time.sleep(min(_base * (_factor ** i), _max_sleep))
                 continue
+            # 其它明确的 4xx（如 403/404）直接抛出
             raise
+        except Exception as e:
+            # 非 APIError 的其他临时错误，也轻微重试一下
+            last_exc = e
+            time.sleep(min(_base * (_factor ** i), _max_sleep))
+            continue
+    # 超过重试次数仍失败：不再抛出，交由上层根据 None 做提前停止或提示
+    return None
+
 
 def _norm_header(cols):
     return [c.replace("\u00A0"," ").replace("\n","").strip().replace(" ","") for c in cols]
@@ -240,59 +267,47 @@ def load_arrivals_df():
     return df[keep]
 
 
+# ======== REPLACE: load_pallet_detail_df（分块+容错，不卡住） ========
 @st.cache_data(ttl=60)
 def load_pallet_detail_df():
     """
     分块读取《托盘明细表》→ 汇总到托盘维度：
     - 仅取必要列（托盘号/仓库代码/运单号 + 可能的重量/长宽高）
-    - 逐块读取，遇到连续 EMPTY_LIMIT 行空行即提早停止
-    - 全程带重试，避免 429/5xx
+    - 2000 行一块，连续空行阈值早停
+    - 所有 gspread 调用均走 _retry，失败则优雅降级而非抛异常
     """
-    # --- 基础：打开 sheet（优先你已有的 get_ws；没有则回退 client.open） ---
+    # 1) 打开 sheet
     try:
         try:
-            ws = get_ws(SHEET_PALLET_DETAIL, "pallet_detail_key")  # 若你已实现 get_ws
+            ws = get_ws(SHEET_PALLET_DETAIL, "pallet_detail_key")
         except NameError:
             ws = client.open(SHEET_PALLET_DETAIL).sheet1
     except SpreadsheetNotFound:
         return pd.DataFrame()
 
-    # --- 小工具 ---
-    def _col_letter(n: int) -> str:
-        """1->A, 2->B ..."""
-        s = ""
-        while n:
-            n, r = divmod(n-1, 26)
-            s = chr(r + 65) + s
-        return s
-
+    # 2) 读表头
+    header_row = _retry(ws.get_values, "1:1")
+    if not header_row:
+        # 返回空 DF（不给页面卡死）
+        return pd.DataFrame()
+    raw_header = header_row[0] if header_row else []
     def _norm_cols(cols):
         return [c.replace("\u00A0"," ").replace("\n","").strip().replace(" ","") for c in cols]
-
-    def _get_range(r1, c1, r2, c2):
-        """A1 区间"""
-        return f"{_col_letter(c1)}{r1}:{_col_letter(c2)}{r2}"
-
-    # --- 读取表头（只读第1行）---
-    header_row = _retry(ws.get_values, "1:1") or [[]]
-    raw_header = header_row[0] if header_row else []
     header = _norm_cols(raw_header)
     if not header:
         return pd.DataFrame()
 
-    # 需要的列名集合（尽量覆盖常见别名）
-    # 关键必需：托盘号/仓库代码/运单号
+    # 别名映射
     alias = {
-        "托盘号": ["托盘号","托盘ID","托盘编号","PalletID","PalletNo","palletid","palletno"],
+        "托盘号":   ["托盘号","托盘ID","托盘编号","PalletID","PalletNo","palletid","palletno"],
         "仓库代码": ["仓库代码","仓库","WH","Warehouse","warehouse"],
-        "运单号": ["运单号","Waybill","waybill","运单编号"],
+        "运单号":   ["运单号","Waybill","waybill","运单编号"],
         "托盘重量": ["托盘重量","托盘重","收费重","托盘收费重","计费重","计费重量","重量"],
-        "托盘长": ["托盘长","长","长度","Length","length","L"],
-        "托盘宽": ["托盘宽","宽","宽度","Width","width","W"],
-        "托盘高": ["托盘高","高","高度","Height","height","H"],
+        "托盘长":   ["托盘长","长","长度","Length","length","L"],
+        "托盘宽":   ["托盘宽","宽","宽度","Width","width","W"],
+        "托盘高":   ["托盘高","高","高度","Height","height","H"],
     }
 
-    # 把需要的列映射到索引（1-based for A1），若没找到就跳过（非必需）
     col_map = {}
     for key, names in alias.items():
         for nm in names:
@@ -304,22 +319,29 @@ def load_pallet_detail_df():
     # 必需列检查
     for must in ["托盘号","仓库代码","运单号"]:
         if must not in col_map:
-            # 尝试最基础的列名再搜一次
             if must in header:
                 col_map[must] = header.index(must) + 1
             else:
-                # 没有关键列，直接返回空
+                # 缺关键列，直接返回空
                 return pd.DataFrame()
 
-    # 计算需要读取的最小列区间
+    # 3) 只读取必要列区间
+    def _col_letter(n: int) -> str:
+        s = ""
+        while n:
+            n, r = divmod(n-1, 26)
+            s = chr(r + 65) + s
+        return s
+    def _get_range(r1, c1, r2, c2):
+        return f"{_col_letter(c1)}{r1}:{_col_letter(c2)}{r2}"
+
     need_cols = [col_map[k] for k in col_map.keys()]
     c1, c2 = min(need_cols), max(need_cols)
 
-    # --- 分块读取 ---
-    CHUNK = 2000          # 每次 2000 行
-    START_ROW = 2         # 从第 2 行开始（第 1 行是表头）
-    MAX_ROWS = 200000     # 硬上限，避免意外
-    EMPTY_LIMIT = 200     # 连续空行阈值，到达就提前停止
+    CHUNK = 2000
+    START_ROW = 2
+    MAX_ROWS = 200000
+    EMPTY_LIMIT = 200
 
     rows = []
     empty_streak = 0
@@ -328,8 +350,17 @@ def load_pallet_detail_df():
 
     while cur <= last_row:
         end = min(cur + CHUNK - 1, last_row)
-        rng = _get_range(cur, c1, end, c2)  # 只拉必要列
-        chunk = _retry(ws.get_values, rng, major_dimension="ROWS") or []
+        rng = _get_range(cur, c1, end, c2)
+        chunk = _retry(ws.get_values, rng, major_dimension="ROWS")
+
+        # 若这块直接失败（_retry 返回 None），不要抛异常，标记为空继续下去
+        if chunk is None:
+            # 当成空块处理；累计空行数
+            empty_streak += (end - cur + 1)
+            if empty_streak >= EMPTY_LIMIT:
+                break
+            cur = end + 1
+            continue
 
         if not chunk:
             empty_streak += (end - cur + 1)
@@ -339,10 +370,8 @@ def load_pallet_detail_df():
             continue
 
         for row in chunk:
-            # 右侧补齐到列宽
             if len(row) < (c2 - c1 + 1):
                 row = row + [""] * ((c2 - c1 + 1) - len(row))
-            # 判断是否“空行”
             if all((str(x).strip() == "") for x in row):
                 empty_streak += 1
                 if empty_streak >= EMPTY_LIMIT:
@@ -350,8 +379,8 @@ def load_pallet_detail_df():
                 continue
             else:
                 empty_streak = 0
-
             rows.append(row)
+
         if empty_streak >= EMPTY_LIMIT:
             break
         cur = end + 1
@@ -359,12 +388,8 @@ def load_pallet_detail_df():
     if not rows:
         return pd.DataFrame()
 
-    # --- 构造成数据框（只含必要列，按逻辑补齐命名）---
-    # 建立“索引 → 标准列名”的逆映射
-    idx_to_name = {}
-    for std_name, idx1 in col_map.items():
-        idx_to_name[idx1 - c1] = std_name  # 相对区间起点的偏移
-
+    # 4) 组装 DF（只含必要列）
+    idx_to_name = { (idx - c1): std for std, idx in col_map.items() }
     data = []
     for r in rows:
         rec = {}
@@ -372,27 +397,30 @@ def load_pallet_detail_df():
             if i in idx_to_name:
                 rec[idx_to_name[i]] = v
         data.append(rec)
-
     df = pd.DataFrame(data)
 
-    # 兜底关键列
-    for k in ["托盘号","仓库代码","运单号"]:
-        if k not in df.columns:
-            df[k] = pd.NA
+    # 5) 规范化
+    def _norm_waybill_str(v):
+        if v is None or (isinstance(v,str) and v.strip()==""):
+            return ""
+        s = str(v).strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        try:
+            f = float(s)
+            if abs(f - round(f)) < 1e-9:
+                s = str(int(round(f)))
+        except:
+            pass
+        return s
 
-    # 规范化
+    for k in ["托盘号","仓库代码","运单号"]:
+        if k not in df.columns: df[k] = pd.NA
     df["托盘号"] = df["托盘号"].astype(str).str.strip()
     df["仓库代码"] = df["仓库代码"].astype(str).str.strip()
     df["运单号"] = df["运单号"].apply(_norm_waybill_str)
 
-    # 数值列
-    if "托盘重量" in df.columns:
-        df["托盘重量"] = pd.to_numeric(df["托盘重量"], errors="coerce")
-    else:
-        df["托盘重量"] = pd.NA
-
-    # L/W/H（inch）→ 体积（仅取该托盘第一组有效 L/W/H）
-    for nm in ["托盘长","托盘宽","托盘高"]:
+    for nm in ["托盘重量","托盘长","托盘宽","托盘高"]:
         if nm in df.columns:
             df[nm] = pd.to_numeric(df[nm], errors="coerce")
 
@@ -407,14 +435,11 @@ def load_pallet_detail_df():
         except Exception:
             pass
         return None
-
     df["_cbm_row"] = df.apply(_cbm_row, axis=1)
 
-    # 分组聚合到“托盘维度”
     def _first_valid_num(s):
         s_num = pd.to_numeric(s, errors="coerce").dropna()
         return float(s_num.iloc[0]) if len(s_num) > 0 else None
-
     def _wb_list(s):
         vals = [x for x in s if isinstance(x, str) and x.strip()]
         return vals
@@ -433,14 +458,14 @@ def load_pallet_detail_df():
           .agg(**agg_dict)
     )
 
-    # 合并时间/承诺信息（来自到仓表）
+    # 合并到仓的时间/承诺信息
     arrivals = load_arrivals_df()
     df_join = df.merge(
         arrivals[["运单号", "ETA/ATA", "ETD/ATD", "对客承诺送仓时间", "_ETAATA_date"]],
         on="运单号", how="left"
     )
 
-    # 客户单号（从自提明细）
+    # 客户单号（自提明细）
     bol_cust_df = load_bol_waybill_costs()
     cust_map = {}
     if not bol_cust_df.empty and "运单号" in bol_cust_df.columns and "客户单号" in bol_cust_df.columns:
@@ -457,7 +482,6 @@ def load_pallet_detail_df():
         p_vol = brow.get("托盘体积", None)
         waybills = brow.get("运单清单_list", []) or []
 
-        # 展示“运单清单”
         waybills_disp = []
         for wb in waybills:
             wb_norm = _norm_waybill_str(wb)
@@ -474,12 +498,9 @@ def load_pallet_detail_df():
             etdatd_s = r.get("ETD/ATD", "")
             promise = r.get("对客承诺送仓时间", "")
             anchor = r.get("_ETAATA_date", None)
-
-            lines_etaata.append(f"{wb}: ETA/ATA {etaata_s if not _is_blank(etaata_s) else '-'}")
-            lines_etdatd.append(f"{wb}: {'' if _is_blank(etdatd_s) else str(etdatd_s)}")
-
-            if not _is_blank(promise):
-                # 复用你现有的差值逻辑
+            lines_etaata.append(f"{wb}: ETA/ATA {etaata_s if str(etaata_s).strip() else '-'}")
+            lines_etdatd.append(f"{wb}: {'' if str(etdatd_s).strip()=='' else str(etdatd_s)}")
+            if str(promise).strip():
                 diffs_days.append(_promise_diff_days_str(str(promise).strip(), anchor or date.today()))
                 promised.append(str(promise).strip())
 
@@ -489,8 +510,7 @@ def load_pallet_detail_df():
 
         def _keyfn(s):
             try:
-                a, _ = s.split("-", 1)
-                return int(a)
+                a, _ = s.split("-", 1); return int(a)
             except Exception:
                 return 10**9
         diff_days_str = sorted(diffs_days, key=_keyfn)[0] if diffs_days else ""
