@@ -140,6 +140,7 @@ def _split_waybill_list(s):
 
 # ========= 数据读取 =========
 @st.cache_data(ttl=60)
+@st.cache_data(ttl=60)
 def load_arrivals_df():
     ws = client.open(SHEET_ARRIVALS_NAME).sheet1
     data = ws.get_all_values(
@@ -150,9 +151,18 @@ def load_arrivals_df():
     header = _norm_header(data[0])
     df = pd.DataFrame(data[1:], columns=header)
 
+    # 兜底必需列
     for need in ["运单号","仓库代码","收费重"]:
         if need not in df.columns: df[need] = pd.NA
 
+    # —— 识别“体积”列（CBM），常见命名：体积/CBM/体积m3/体积(m3)/体积（m3）
+    vol_col = next((c for c in ["体积","CBM","体积m3","体积(m3)","体积（m3）"] if c in df.columns), None)
+    if vol_col is None:
+        df["体积"] = pd.NA
+    else:
+        df["体积"] = pd.to_numeric(df[vol_col], errors="coerce")
+
+    # ETA/ATA 合并列识别
     etaata_col = None
     for cand in ["ETA/ATA","ETAATA"]:
         if cand in df.columns:
@@ -169,10 +179,12 @@ def load_arrivals_df():
         df["预计到仓时间（日）"] = pd.NA
         eta_wh_col = "预计到仓时间（日）"
 
+    # 规范化
     df["运单号"] = df["运单号"].apply(_norm_waybill_str)
     df["仓库代码"] = df["仓库代码"].astype(str).str.strip()
     df["收费重"] = pd.to_numeric(df["收费重"], errors="coerce")
 
+    # 解析日期列
     if etaata_col is not None:
         df["_ETAATA_date"] = df[etaata_col].apply(_parse_sheet_value_to_date)
         df["ETA/ATA"] = df["_ETAATA_date"].apply(_fmt_date).replace("", pd.NA)
@@ -188,12 +200,14 @@ def load_arrivals_df():
     df["_ETA_WH_date"] = df[eta_wh_col].apply(_parse_sheet_value_to_date)
     df["预计到仓时间（日）"] = df["_ETA_WH_date"].apply(_fmt_date).replace("", pd.NA)
 
+    # 去重（保留最后一条）
     df = df.drop_duplicates(subset=["运单号"], keep="last")
 
-    keep = ["仓库代码","运单号","收费重",
+    keep = ["仓库代码","运单号","收费重","体积",
             "ETA/ATA","ETD/ATD","对客承诺送仓时间","预计到仓时间（日）",
             "_ETAATA_date"]
     return df[keep]
+
 
 @st.cache_data(ttl=60)
 def load_pallet_detail_df():
@@ -612,35 +626,30 @@ def _extract_pure_waybills(mixed: str) -> list[str]:
 
 def build_waybill_delta():
     """
-    从《发货追踪》聚合到“运单粒度”的增量数据，供部分更新《运单全链路汇总》使用。
-    关键点：
-      - 《发货追踪》的“运单清单”可以是 'USSH(IP...)' 合并格式，
-        本函数在计算/匹配时会提取“纯运单号”。
-      - “客户单号”的优先级：『bol自提明细』 > 『托盘明细表』 > 『到仓数据表』。
-      - '到仓日期' 来源于《到仓数据表》的“预计到仓时间（日）”。
+    聚合到“运单粒度”的增量数据，供部分更新《运单全链路汇总》：
+      - 『收费重』『体积』『仓库代码』：直接来自《到仓数据表》
+      - 『到仓日期』：来自《到仓数据表》“预计到仓时间（日）”
+      - 『发走费用/车号/日期』：仍由《发货追踪》按“收费重”权重（缺失则均分）分摊
+      - 『到BCF 三件套』：来自『bol自提明细』
     """
-    arrivals = load_arrivals_df()         # 需要：ETD/ATD、ETA/ATA、收费重、预计到仓时间（日）
-    bol      = load_bol_waybill_costs()   # 需要：客户单号、到BCF日期/卡车号/费用
-    track    = load_ship_tracking_raw()   # 需要：运单清单、分摊费用、卡车单号、日期
+    arrivals = load_arrivals_df()
+    bol      = load_bol_waybill_costs()
+    track    = load_ship_tracking_raw()
 
-    # 1) 先从《发货追踪》里抽取“纯运单号集合”
     wb_from_track = set()
     for _, r in track.iterrows():
         for wb in _extract_pure_waybills(r.get("运单清单", "")):
-            if wb:
-                wb_from_track.add(wb)
+            if wb: wb_from_track.add(wb)
 
-    # 若没有可用运单，返回空框架（列顺序按你的目标汇总表）
     if not wb_from_track:
         return pd.DataFrame(columns=[
-            "运单号","客户单号",
+            "运单号","客户单号","仓库代码","收费重","体积",
             "发出(ETD/ATD)","到港(ETA/ATA)",
             "到BCF日期","发走日期","到仓日期",
             "到BCF卡车号","到BCF费用",
             "发走卡车号","发走费用"
         ])
 
-    # 2) 仅保留与发货有关的 arrivals/bol 记录，准备权重映射
     arrivals = arrivals[arrivals["运单号"].isin(wb_from_track)].copy()
     if not bol.empty:
         bol = bol[bol["运单号"].isin(wb_from_track)].copy()
@@ -650,48 +659,40 @@ def build_waybill_delta():
         pd.to_numeric(arrivals["收费重"], errors="coerce")
     ))
 
-    # 3) 遍历《发货追踪》按托盘分摊费用到“运单”
-    wb2_cost   = {}            # 运单 → 累计发走费用
-    wb2_trucks = {}            # 运单 → {发走卡车号}
-    wb2_date   = {}            # 运单 → 最早发走日期(date对象)
-
+    wb2_cost, wb2_trucks, wb2_date = {}, {}, {}
     for _, r in track.iterrows():
         waybills = _extract_pure_waybills(r.get("运单清单", ""))
         waybills = [wb for wb in waybills if wb in wb_from_track]
         if not waybills:
             continue
-
         pallet_cost = _to_num_safe(r.get("分摊费用"))
-        if pallet_cost is None:
-            continue
-
-        truck_no = r.get("卡车单号", "")
-        dt_str   = r.get("日期", None)
-        dt_obj   = _parse_sheet_value_to_date(dt_str) if not _is_blank(dt_str) else None
+        truck_no    = r.get("卡车单号", "")
+        dt_str      = r.get("日期", None)
+        dt_obj      = _parse_sheet_value_to_date(dt_str) if not _is_blank(dt_str) else None
 
         weights = [weight_map.get(wb, None) for wb in waybills]
         valid   = [w for w in weights if w and w > 0]
         if valid and sum(valid) > 0:
-            total_w = sum([w for w in weights if w and w > 0])
+            total_w = sum(valid)
             shares  = [(w/total_w if (w and w > 0) else 0.0) for w in weights]
         else:
-            shares  = [1.0 / len(waybills)] * len(waybills)
+            shares  = [1.0/len(waybills)] * len(waybills)
 
-        for wb, s in zip(waybills, shares):
-            add = pallet_cost * s
-            wb2_cost[wb] = wb2_cost.get(wb, 0.0) + add
-            if truck_no:
+        if pallet_cost is not None:
+            for wb, s in zip(waybills, shares):
+                wb2_cost[wb] = wb2_cost.get(wb, 0.0) + pallet_cost * s
+        if truck_no:
+            for wb in waybills:
                 wb2_trucks.setdefault(wb, set()).add(truck_no)
-            if dt_obj:
+        if dt_obj:
+            for wb in waybills:
                 if (wb not in wb2_date) or (dt_obj < wb2_date[wb]):
                     wb2_date[wb] = dt_obj
 
-    # 4) 组装输出 DataFrame（仅运单粒度）
     out = pd.DataFrame({"运单号": sorted(wb_from_track)})
 
-    # 4.1 从到仓表并入 ETD/ATD、ETA/ATA、以及“到仓日期”（预计到仓时间（日））
     if not arrivals.empty:
-        arr2 = arrivals[["运单号", "ETD/ATD", "ETA/ATA", "预计到仓时间（日）"]].copy()
+        arr2 = arrivals[["运单号","仓库代码","收费重","体积","ETD/ATD","ETA/ATA","预计到仓时间（日）"]].copy()
         arr2 = arr2.rename(columns={
             "ETD/ATD": "发出(ETD/ATD)",
             "ETA/ATA": "到港(ETA/ATA)",
@@ -699,62 +700,49 @@ def build_waybill_delta():
         })
         out = out.merge(arr2, on="运单号", how="left")
     else:
+        out["仓库代码"] = pd.NA
+        out["收费重"] = pd.NA
+        out["体积"]   = pd.NA
         out["发出(ETD/ATD)"] = pd.NA
         out["到港(ETA/ATA)"] = pd.NA
         out["到仓日期"]       = pd.NA
 
-    # 4.2 客户单号：优先 bol > pallet > arrivals
+    # 客户单号合并逻辑（略，同之前）
     cust_bol = bol[["运单号","客户单号"]] if (not bol.empty and "客户单号" in bol.columns) \
                else pd.DataFrame(columns=["运单号","客户单号"])
-    cust_pal = load_customer_refs_from_pallet()   # 托盘明细表中若有客户单号
-    cust_arr = load_customer_refs_from_arrivals() # 到仓数据表中若有客户单号
-
+    cust_pal = load_customer_refs_from_pallet()
+    cust_arr = load_customer_refs_from_arrivals()
     for d in (cust_pal, cust_arr):
         if not d.empty:
             d.drop_duplicates(subset=["运单号"], inplace=True)
             d["运单号"] = d["运单号"].map(_norm_waybill_str)
-
-    cust_all = pd.concat([
-        cust_bol.assign(_pri=1),
-        cust_pal.assign(_pri=2),
-        cust_arr.assign(_pri=3)
-    ], ignore_index=True)
-
+    cust_all = pd.concat([cust_bol.assign(_pri=1), cust_pal.assign(_pri=2), cust_arr.assign(_pri=3)], ignore_index=True)
     if not cust_all.empty:
         cust_all = cust_all[cust_all["运单号"].isin(wb_from_track)]
-        cust_all = cust_all[
-            ~cust_all["客户单号"].isna() & (cust_all["客户单号"].astype(str) != "")
-        ]
-        cust_all = (
-            cust_all.sort_values(["运单号","_pri"])
-                    .drop_duplicates(subset=["运单号"], keep="first")[["运单号","客户单号"]]
-        )
+        cust_all = cust_all[~cust_all["客户单号"].isna() & (cust_all["客户单号"].astype(str)!="")]
+        cust_all = (cust_all.sort_values(["运单号","_pri"])
+                            .drop_duplicates(subset=["运单号"], keep="first")[["运单号","客户单号"]])
         out = out.merge(cust_all, on="运单号", how="left")
     else:
         out["客户单号"] = pd.NA
 
-    # 4.3 从自提明细合并“到BCF”三件套
     if not bol.empty:
-        out = out.merge(
-            bol[["运单号", "到BCF日期", "到BCF卡车号", "到BCF费用"]],
-            on="运单号", how="left"
-        )
+        out = out.merge(bol[["运单号","到BCF日期","到BCF卡车号","到BCF费用"]], on="运单号", how="left")
     else:
         for c in ["到BCF日期","到BCF卡车号","到BCF费用"]:
             out[c] = pd.NA
 
-    # 4.4 发走信息（费用 / 车号 / 日期）
     out["发走费用"]   = out["运单号"].map(lambda wb: round(wb2_cost.get(wb, 0.0), 2) if wb in wb2_cost else pd.NA)
     out["发走卡车号"] = out["运单号"].map(lambda wb: ", ".join(sorted(wb2_trucks.get(wb, []))) if wb in wb2_trucks else pd.NA)
     out["发走日期"]   = out["运单号"].map(lambda wb: _fmt_date(wb2_date.get(wb)) if wb in wb2_date else pd.NA)
 
-    # 4.5 规整数值
+    out["收费重"]   = pd.to_numeric(out["收费重"], errors="coerce")
+    out["体积"]     = pd.to_numeric(out["体积"], errors="coerce").round(2)
     out["到BCF费用"] = pd.to_numeric(out["到BCF费用"], errors="coerce").round(2)
-    out["发走费用"]  = pd.to_numeric(out["发走费用"],  errors="coerce").round(2)
+    out["发走费用"]  = pd.to_numeric(out["发走费用"], errors="coerce").round(2)
 
-    # 4.6 统一列顺序（与你的目标表一致）
     final_cols = [
-        "运单号","客户单号",
+        "运单号","客户单号","仓库代码","收费重","体积",
         "发出(ETD/ATD)","到港(ETA/ATA)",
         "到BCF日期","发走日期","到仓日期",
         "到BCF卡车号","到BCF费用",
@@ -763,19 +751,20 @@ def build_waybill_delta():
     for c in final_cols:
         if c not in out.columns:
             out[c] = pd.NA
-    out = out[final_cols]
+    return out[final_cols]
 
-    return out
 # ===================== REPLACEMENT END =====================
 
 
 def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
     target_cols = [
-        "客户单号",
-        "发出(ETD/ATD)","到港(ETA/ATA)",
-        "到BCF日期","到BCF卡车号","到BCF费用",
-        "发走日期","发走卡车号","发走费用"
-    ]
+    "客户单号","仓库代码","收费重","体积",
+    "发出(ETD/ATD)","到港(ETA/ATA)",
+    "到BCF日期","到BCF卡车号","到BCF费用",
+    "发走日期","发走卡车号","发走费用"
+]
+
+
     try:
         ws = client.open(SHEET_WB_SUMMARY).sheet1
     except SpreadsheetNotFound:
