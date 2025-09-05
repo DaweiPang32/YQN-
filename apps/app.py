@@ -5,6 +5,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import SpreadsheetNotFound, APIError
 from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
 import time
 import re
 import zlib
@@ -277,8 +278,7 @@ with tools_l:
     if st.button("🔄 仅刷新数据表缓存"):
         load_ship_detail_df.clear()
         load_arrivals_df.clear()
-        st.experimental_rerun()
-
+        st.rerun()
 # ========= 初始化状态 =========
 if "all_pallets" not in st.session_state:
     st.session_state["all_pallets"] = []
@@ -473,6 +473,7 @@ for pallet_id in list(st.session_state["all_pallets"]):
 
             # ===== 方式二：逐条选择（保留）=====
             with tab_manual:
+
                 num_entries = st.number_input(
                     f"添加运单数量 - 托盘 {pallet_id}",
                     min_value=1, step=1, value=1, key=f"num_{pallet_id}"
@@ -652,8 +653,7 @@ if st.session_state["pallet_detail_records"]:
                 kept = [r for i, r in enumerate(updated_records) if i not in to_delete_idx]
                 st.session_state["pallet_detail_records"] = kept
                 st.success(f"已删除 {len(to_delete_idx)} 条记录")
-                st.experimental_rerun()
-            else:
+                st.rerun()            else:
                 st.info("未勾选要删除的记录。")
 
     st.markdown("---")
@@ -666,10 +666,16 @@ if st.session_state["pallet_detail_records"]:
         if st.button("📤 SUBMIT"):
             df_upload = pd.DataFrame(st.session_state["pallet_detail_records"]).copy()
 
+            # 统一列名：四个尺寸列改名（你原有逻辑）
             rename_map = {"重量": "托盘重量", "长": "托盘长", "宽": "托盘宽", "高": "托盘高"}
             df_upload.rename(columns=rename_map, inplace=True)
 
-            # 日期列转字符串
+            # ==== 新增：提交时刻（以洛杉矶本地时间） ====
+            now_la = datetime.now(ZoneInfo("America/Los_Angeles"))
+            df_upload["托盘创建日期"] = now_la.strftime("%Y-%m-%d")
+            df_upload["托盘创建时间"] = now_la.strftime("%H:%M:%S")
+
+            # 日期列转字符串（含 ETA 列）
             dt_cols = df_upload.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns.tolist()
             if "ETA(到BCF)" in df_upload.columns and df_upload["ETA(到BCF)"].dtype == object:
                 df_upload["ETA(到BCF)"] = pd.to_datetime(df_upload["ETA(到BCF)"], errors="coerce")
@@ -691,20 +697,36 @@ if st.session_state["pallet_detail_records"]:
 
             existing = _retry(ssheet.get_all_values)
             if not existing:
+                # 表为空：直接用当前 df 的列作为新表头（包含新加的两列）
                 header = df_upload.columns.tolist()
                 rows = df_upload.fillna("").values.tolist()
                 _retry(ssheet.update, [header] + rows)
             else:
+                # 表已存在：如缺少新列，则扩展表头到末尾
                 existing_header = existing[0]
+
+                # 合并表头（保留原有顺序，在末尾补齐 df_upload 中的新增列）
+                merged_header = existing_header[:]
+                for col in df_upload.columns:
+                    if col not in merged_header:
+                        merged_header.append(col)
+
+                # 若 header 有变化，先更新第 1 行的表头到 merged_header
+                if merged_header != existing_header:
+                    # 只更新表头行；A1 栏位更新为更长的表头是安全的
+                    _retry(ssheet.update, "1:1", [merged_header])
+
+                # 按 merged_header 顺序组织要追加的行；不存在的列补空
                 tmp = df_upload.copy()
-                for col in existing_header:
+                for col in merged_header:
                     if col not in tmp.columns:
                         tmp[col] = ""
-                rows = tmp.reindex(columns=existing_header).fillna("").values.tolist()
+                rows = tmp.reindex(columns=merged_header).fillna("").values.tolist()
+
                 _retry(ssheet.append_rows, rows, value_input_option="USER_ENTERED")
 
             st.success(f"✅ 已追加上传 {len(df_upload)} 条托盘明细到「{SHEET_PALLET_DETAIL}」")
 
             if clear_after:
                 st.session_state["pallet_detail_records"] = []
-                st.experimental_rerun()
+                st.rerun()
