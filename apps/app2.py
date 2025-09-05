@@ -36,10 +36,10 @@ client = get_gspread_client()
 
 # ========= 表名配置 =========
 SHEET_ARRIVALS_NAME   = "到仓数据表"       # ETD/ATD、ETA/ATA（合并）、对客承诺送仓时间、预计到仓时间（日）
-SHEET_PALLET_DETAIL   = "托盘明细表test"       # 托盘数据（重量/体积来自此表；体积由 L/W/H(inch) 计算为 CBM）
-SHEET_SHIP_TRACKING   = "发货追踪test"     # 托盘维度出仓记录（分摊到托盘）
+SHEET_PALLET_DETAIL   = "托盘明细表"       # 托盘数据（重量/体积来自此表；体积由 L/W/H(inch) 计算为 CBM）
+SHEET_SHIP_TRACKING   = "发货追踪"     # 托盘维度出仓记录（分摊到托盘）
 SHEET_BOL_DETAIL      = "bol自提明细"      # 到BCF 明细（分摊到运单）
-SHEET_WB_SUMMARY      = "运单全链路汇总test"    # 仅部分更新
+SHEET_WB_SUMMARY      = "运单全链路汇总"    # 仅部分更新
 
 # ========= 基础工具 =========
 def _norm_header(cols):
