@@ -8,6 +8,7 @@
 #   仅更新以下列：客户单号、发出(ETD/ATD)、到港(ETA/ATA)、到BCF日期、到BCF卡车号、到BCF费用、发走日期、发走卡车号、发走费用
 # - 只针对『发货追踪』里出现过的运单号进行汇总/更新
 # - 兼容『bol自提明细』/『发货追踪』实际列名（卡车号/费用/日期/客户单号等）
+# - 新增：在托盘展示中显示《托盘明细表》提交时写入的【托盘创建日期 / 托盘创建时间】
 
 import streamlit as st
 import pandas as pd
@@ -33,13 +34,12 @@ def get_gspread_client():
 
 client = get_gspread_client()
 
-
 # ========= 表名配置 =========
 SHEET_ARRIVALS_NAME   = "到仓数据表"       # ETD/ATD、ETA/ATA（合并）、对客承诺送仓时间、预计到仓时间（日）
-SHEET_PALLET_DETAIL   = "托盘明细表"       # 托盘数据（重量/体积来自此表；体积由 L/W/H(inch) 计算为 CBM）
-SHEET_SHIP_TRACKING   = "发货追踪test"          # 托盘维度出仓记录（分摊到托盘）
+SHEET_PALLET_DETAIL   = "托盘明细表test"       # 托盘数据（重量/体积来自此表；体积由 L/W/H(inch) 计算为 CBM）
+SHEET_SHIP_TRACKING   = "发货追踪test"     # 托盘维度出仓记录（分摊到托盘）
 SHEET_BOL_DETAIL      = "bol自提明细"      # 到BCF 明细（分摊到运单）
-SHEET_WB_SUMMARY      = "运单全链路汇总"    # 仅部分更新：客户单号/ETD/ETA/到BCF/发走相关列
+SHEET_WB_SUMMARY      = "运单全链路汇总test"    # 仅部分更新
 
 # ========= 基础工具 =========
 def _norm_header(cols):
@@ -66,6 +66,49 @@ def _is_blank(v):
     except Exception:
         try: return bool(pd.isna(v))
         except Exception: return False
+def _coerce_excel_serial_sum(v):
+    """
+    将各种形态的输入合并为 Excel/GS 序列天数（可含小数的天数）：
+    - 数字：直接返回
+    - 字符串：提取其中的所有数字（含小数），累加（适配 '45905 0.6855' 这类）
+    - 列表/元组：把其中能转数字的项累加
+    解析失败返回 None
+    """
+    # 单个数字
+    try:
+        if isinstance(v, (int, float)) and not pd.isna(v):
+            return float(v)
+    except Exception:
+        pass
+
+    # 字符串里抽取所有数字片段并相加
+    if isinstance(v, str):
+        nums = re.findall(r'[-+]?\d+(?:\.\d+)?', v)
+        total = 0.0
+        ok = False
+        for n in nums:
+            try:
+                total += float(n); ok = True
+            except Exception:
+                pass
+        if ok:
+            return total
+
+    # 可迭代（如 list/tuple）逐项相加
+    if isinstance(v, (list, tuple)):
+        total = 0.0
+        ok = False
+        for x in v:
+            try:
+                if x is None or (isinstance(x, float) and pd.isna(x)):
+                    continue
+                total += float(x); ok = True
+            except Exception:
+                pass
+        if ok:
+            return total
+
+    return None
 
 def _norm_waybill_str(v):
     if _is_blank(v): return ""
@@ -77,29 +120,101 @@ def _norm_waybill_str(v):
     except: pass
     return s
 
-_BASE = datetime(1899, 12, 30)  # Excel/GS 起点
+# Excel/GS 序列的起点（若文件顶部已有 _BASE，可保留一处即可）
+_BASE = datetime(1899, 12, 30)
+
+def _coerce_excel_serial_sum(v):
+    """
+    将 v 合并为 Excel/GS 序列天数（可含小数）。
+    兼容：
+    - '45905 0.6855' / '45905\t0,6855' / '45905\u00A00.6855'
+    - 混合分隔符、中文标点、不可见空白
+    - 逗号小数（0,6855 -> 0.6855）
+    - 列表/元组中的多片段
+    解析失败返回 None
+    """
+    # 单个数字
+    try:
+        if isinstance(v, (int, float)) and not pd.isna(v):
+            return float(v)
+    except Exception:
+        pass
+
+    # 字符串：抽取全部数字片段并累加
+    if isinstance(v, str):
+        s = v.strip()
+        s = re.sub(r'[\u00A0\u2000-\u200B]', ' ', s)  # 各类不可见空白 -> 空格
+        s = s.replace(',', '.')                       # 逗号小数 -> 点
+        nums = re.findall(r'[-+]?\d+(?:\.\d+)?', s)
+        total, ok = 0.0, False
+        for n in nums:
+            try:
+                total += float(n); ok = True
+            except Exception:
+                pass
+        if ok:
+            return total
+
+    # 可迭代（list/tuple）：逐项相加
+    if isinstance(v, (list, tuple)):
+        total, ok = 0.0, False
+        for x in v:
+            if x is None or (isinstance(x, float) and pd.isna(x)):
+                continue
+            try:
+                xs = str(x).strip().replace(',', '.')
+                total += float(xs); ok = True
+            except Exception:
+                pass
+        if ok:
+            return total
+
+    return None
+
+
 def _parse_sheet_value_to_date(v):
-    if _is_blank(v): return None
+    """
+    更强健的“值 -> 日期(date)”解析：
+    1) 先把 v 合并成 Excel/GS 天数（含小数），成功则按序列转换（丢弃时间部分）
+    2) 不行再尝试数值范围/时间戳
+    3) 最后用 pandas 兜底
+    """
+    # ① 合并“日期+时间片段”
+    serial = _coerce_excel_serial_sum(v)
+    if serial is not None:
+        try:
+            dt = _BASE + timedelta(days=float(serial))
+            return dt.date()
+        except Exception:
+            pass
+
+    # ② 退路：原数值路径
+    if _is_blank(v):
+        return None
     n = _to_num(v)
     if n is not None:
         if 30000 <= n <= 80000:
             return (_BASE + timedelta(days=n)).date()
         if 80000 < n < 200000:
             return (_BASE + timedelta(days=n/2.0)).date()
-        if 1e9 <= n < 2e10:
+        if 1e9 <= n < 2e10:           # 秒时间戳
             try: return datetime.utcfromtimestamp(n).date()
             except: pass
-        if 1e12 <= n < 2e13:
+        if 1e12 <= n < 2e13:          # 毫秒时间戳
             try: return datetime.utcfromtimestamp(n/1000.0).date()
             except: pass
         try: return (_BASE + timedelta(days=n)).date()
         except: pass
+
+    # ③ pandas 兜底
     try:
         dt = pd.to_datetime(v, errors="coerce")
         if pd.isna(dt): return None
         return dt.date()
     except Exception:
         return None
+
+
 
 def _fmt_date(d: date, out_fmt="%Y-%m-%d"):
     return d.strftime(out_fmt) if isinstance(d, date) else ""
@@ -132,11 +247,78 @@ def _promise_diff_days_str(win: str, anchor: date | None):
     x = (start_d - today).days
     y2 = (end_d   - today).days
     return f"{x}-{y2}"
+def _excel_serial_to_dt(v):
+    """
+    将任意形态的 Excel/GS 序列（含小数）或带有数字的字符串转为 datetime（含日期与时间）。
+    - 支持 '45905 0.6855'、'45905,0.6855'、列表 [45905, 0.6855] 等
+    - 返回 datetime 或 None
+    """
+    serial = _coerce_excel_serial_sum(v)
+    if serial is None:
+        # 再试：直接解析时间字符串（如 '14:25'）
+        try:
+            ts = pd.to_datetime(str(v), errors="coerce")
+            if pd.isna(ts):
+                return None
+            # 若只有时间而无日期，则用今天的日期
+            if ts.year < 1900:
+                base = datetime.combine(date.today(), ts.time())
+                return base
+            return ts.to_pydatetime()
+        except Exception:
+            return None
+    try:
+        return _BASE + timedelta(days=float(serial))
+    except Exception:
+        return None
+
+def _fmt_time_from_any(v, out_fmt="%H:%M"):
+    """
+    将各种形态（序列/字符串/列表）解析为时间字符串 HH:MM。
+    - 若 v 是仅时间小数（如 0.6855）也可
+    - 若 v 包含日期+时间（如 45905.6855 / '45905 0.6855'）也可
+    """
+    dt = _excel_serial_to_dt(v)
+    return dt.strftime(out_fmt) if isinstance(dt, datetime) else ""
+
+def _split_dt_to_date_time_str(date_raw, time_raw):
+    """
+    智能从“日期列/时间列”提取最终的日期字符串与时间字符串。
+    优先：
+      1) 从 date_raw 中解析到日期；若其中带有时间也用于 time 兜底
+      2) 从 time_raw 中解析时间；若 time_raw 为空则尝试从 date_raw 的小数部分取时间
+    """
+    d_dt = _excel_serial_to_dt(date_raw)
+    t_dt = _excel_serial_to_dt(time_raw)
+
+    # 日期
+    if isinstance(d_dt, datetime):
+        date_str = d_dt.date().strftime("%Y-%m-%d")
+    elif isinstance(t_dt, datetime):
+        # 只有时间，给今天的日期
+        date_str = date.today().strftime("%Y-%m-%d")
+    else:
+        date_str = ""
+
+    # 时间
+    time_str = ""
+    if isinstance(t_dt, datetime):
+        time_str = t_dt.strftime("%H:%M")
+    elif isinstance(d_dt, datetime):
+        # date_raw 里可能也带小数 -> 有时间
+        time_str = d_dt.strftime("%H:%M")
+    return date_str, time_str
 
 def _split_waybill_list(s):
     if _is_blank(s): return []
     parts = re.split(r"[,\，;\；、\|\/\s]+", str(s))
     return [_norm_waybill_str(p) for p in parts if _norm_waybill_str(p)]
+
+def _first_nonblank_str(s):
+    for x in s:
+        if not _is_blank(x):
+            return str(x).strip()
+    return ""
 
 # ========= 数据读取 =========
 @st.cache_data(ttl=60)
@@ -154,7 +336,7 @@ def load_arrivals_df():
     for need in ["运单号","仓库代码","收费重"]:
         if need not in df.columns: df[need] = pd.NA
 
-    # —— 识别“体积”列（CBM），常见命名：体积/CBM/体积m3/体积(m3)/体积（m3）
+    # —— 识别“体积”列（CBM）
     vol_col = next((c for c in ["体积","CBM","体积m3","体积(m3)","体积（m3）"] if c in df.columns), None)
     if vol_col is None:
         df["体积"] = pd.NA
@@ -183,7 +365,7 @@ def load_arrivals_df():
     df["仓库代码"] = df["仓库代码"].astype(str).str.strip()
     df["收费重"] = pd.to_numeric(df["收费重"], errors="coerce")
 
-    # 解析日期列
+    # 解析日期列 —— 统一“强制覆盖为日期字符串”，失败则空，不保留原串
     if etaata_col is not None:
         df["_ETAATA_date"] = df[etaata_col].apply(_parse_sheet_value_to_date)
         df["ETA/ATA"] = df["_ETAATA_date"].apply(_fmt_date).replace("", pd.NA)
@@ -192,9 +374,7 @@ def load_arrivals_df():
         df["ETA/ATA"] = pd.NA
 
     df["_ETD_ATD_date"] = df["ETD/ATD"].apply(_parse_sheet_value_to_date)
-    df["ETD/ATD"] = df["_ETD_ATD_date"].apply(_fmt_date).where(
-        df["_ETD_ATD_date"].notna(), df["ETD/ATD"]
-    )
+    df["ETD/ATD"] = df["_ETD_ATD_date"].apply(_fmt_date).replace("", pd.NA)
 
     df["_ETA_WH_date"] = df[eta_wh_col].apply(_parse_sheet_value_to_date)
     df["预计到仓时间（日）"] = df["_ETA_WH_date"].apply(_fmt_date).replace("", pd.NA)
@@ -216,7 +396,58 @@ def load_pallet_detail_df():
     - 托盘体积（CBM）：由 L/W/H(inch) 计算（每个托盘仅计算一次体积，取该托盘组内第一组有效 L/W/H）
     - 同时输出每托盘的“长(in)/宽(in)/高(in)”（各取首个有效值，仅用于显示）
     - ETA/ATA 使用“合并列”（来自到仓表），展示为 'ETA/ATA yyyy-mm-dd'
+    - 新增：聚合《托盘明细表》中提交时写入的“托盘创建日期/托盘创建时间”（解析为 YYYY-MM-DD / HH:MM）
     """
+    # === 内部仅供本函数使用的小工具（依赖全局 _BASE / _coerce_excel_serial_sum）===
+    def _excel_serial_to_dt(v):
+        """将 Excel/GS 序列（含小数）或带数字的字符串转为 datetime；失败返回 None。"""
+        serial = _coerce_excel_serial_sum(v)
+        if serial is None:
+            # 兜底：尝试直接解析字符串时间（如 '14:25'）
+            try:
+                ts = pd.to_datetime(str(v), errors="coerce")
+                if pd.isna(ts):
+                    return None
+                # 只有时间而无日期时（年份异常），给今天日期
+                if ts.year < 1900:
+                    return datetime.combine(date.today(), ts.time())
+                return ts.to_pydatetime()
+            except Exception:
+                return None
+        try:
+            return _BASE + timedelta(days=float(serial))
+        except Exception:
+            return None
+
+    def _split_dt_to_date_time_str(date_raw, time_raw):
+        """
+        智能从“日期列/时间列”提取最终的日期字符串与时间字符串（24h HH:MM）。
+        优先：
+          1) 从 date_raw 中解析到日期；若其中带小数时间也可用于 time
+          2) 从 time_raw 中解析时间；若空则回退到 date_raw 的时间部分
+        """
+        d_dt = _excel_serial_to_dt(date_raw)
+        t_dt = _excel_serial_to_dt(time_raw)
+
+        # 日期
+        if isinstance(d_dt, datetime):
+            date_str = d_dt.date().strftime("%Y-%m-%d")
+        elif isinstance(t_dt, datetime):
+            date_str = date.today().strftime("%Y-%m-%d")
+        else:
+            date_str = ""
+
+        # 时间
+        if isinstance(t_dt, datetime):
+            time_str = t_dt.strftime("%H:%M")
+        elif isinstance(d_dt, datetime):
+            time_str = d_dt.strftime("%H:%M")
+        else:
+            time_str = ""
+
+        return date_str, time_str
+    # === 小工具结束 ===
+
     ws = client.open(SHEET_PALLET_DETAIL).sheet1
     vals = ws.get_all_values(
         value_render_option="UNFORMATTED_VALUE",
@@ -228,7 +459,7 @@ def load_pallet_detail_df():
     header = _norm_header(vals[0])
     df = pd.DataFrame(vals[1:], columns=header)
 
-    # 兜底关键列
+    # 兜底关键列：托盘号/仓库代码/运单号
     if "托盘号" not in df.columns:
         for cand in ["托盘ID","托盘编号","PalletID","PalletNo","palletid","palletno"]:
             if cand in df.columns:
@@ -248,12 +479,12 @@ def load_pallet_detail_df():
     if "运单号" not in df.columns:
         df["运单号"] = pd.NA
 
-    # 规范
+    # 规范化基础字段
     df["托盘号"] = df["托盘号"].astype(str).str.strip()
     df["仓库代码"] = df["仓库代码"].astype(str).str.strip()
     df["运单号"] = df["运单号"].apply(_norm_waybill_str)
 
-    # 识别重量列（来自托盘明细）
+    # 识别重量列（来自托盘明细；只用托盘表，不从到仓表带）
     weight_col = None
     for cand in ["托盘重量","托盘重","收费重","托盘收费重","计费重","计费重量","重量"]:
         if cand in df.columns:
@@ -284,13 +515,7 @@ def load_pallet_detail_df():
             pass
         return None
 
-    # 行级体积（只为后续“取该托盘第一条有效体积”做准备）
     df["_cbm_row"] = df.apply(_cbm_row, axis=1)
-
-    # 聚合到托盘
-    def _first_valid(s):
-        s_num = pd.to_numeric(s, errors="coerce").dropna()
-        return float(s_num.iloc[0]) if len(s_num) > 0 else None
 
     def _first_valid_num(s):
         s_num = pd.to_numeric(s, errors="coerce").dropna()
@@ -300,11 +525,24 @@ def load_pallet_detail_df():
         vals = [x for x in s if isinstance(x, str) and x.strip()]
         return vals
 
-    # 动态构造聚合字典
+    # 识别“托盘创建日期/时间”列（收货 App 提交时写入）
+    create_date_col = next((c for c in ["托盘创建日期","创建日期","PalletCreateDate","CreateDate"] if c in df.columns), None)
+    create_time_col = next((c for c in ["托盘创建时间","创建时间","PalletCreateTime","CreateTime"] if c in df.columns), None)
+    if create_date_col is None:
+        df["托盘创建日期"] = ""
+        create_date_col = "托盘创建日期"
+    if create_time_col is None:
+        df["托盘创建时间"] = ""
+        create_time_col = "托盘创建时间"
+
+    # === 聚合到托盘 ===
     agg_dict = {
         "托盘重量": (weight_col, lambda s: pd.to_numeric(s, errors="coerce").dropna().sum()),
-        "托盘体积": ("_cbm_row", _first_valid),  # 每托盘仅取第一条有效体积
+        "托盘体积": ("_cbm_row", _first_valid_num),  # 每托盘仅取第一条有效体积
         "运单清单_list": ("运单号", _wb_list),
+        # 创建日期/时间取首个非空原始值（稍后统一解析）
+        "托盘创建日期_raw": (create_date_col, _first_nonblank_str),
+        "托盘创建时间_raw": (create_time_col, _first_nonblank_str),
     }
     if len_col:
         agg_dict["托盘长in"] = (len_col, _first_valid_num)
@@ -318,34 +556,49 @@ def load_pallet_detail_df():
           .agg(**agg_dict)
     )
 
-    # 与到仓数据合并以生成展示字符串
+    # 与到仓数据合并（为展示 ETA/ATA、ETD/ATD、承诺时段）
     arrivals = load_arrivals_df()  # 需要：ETA/ATA, ETD/ATD, 对客承诺送仓时间, _ETAATA_date
     df_join = df.merge(
         arrivals[["运单号", "ETA/ATA", "ETD/ATD", "对客承诺送仓时间", "_ETAATA_date"]],
         on="运单号", how="left"
     )
+
+    # 客户单号映射（优先来自『bol自提明细』）
     bol_cust_df = load_bol_waybill_costs()
     cust_map = {}
     if not bol_cust_df.empty and "运单号" in bol_cust_df.columns and "客户单号" in bol_cust_df.columns:
-        # 仅使用自提明细来源（用户要求）
         for _, rr in bol_cust_df.iterrows():
             wb = _norm_waybill_str(rr.get("运单号", ""))
             cust = str(rr.get("客户单号", "")).strip()
             if wb and cust:
                 cust_map[wb] = cust
+
+    # === 逐托盘组装展示项 ===
     pallets = []
     for _, brow in base.iterrows():
         pid, wh = brow["托盘号"], brow["仓库代码"]
+        if _is_blank(pid):
+            continue
+
         p_wt = brow.get("托盘重量", None)
         p_vol = brow.get("托盘体积", None)
+
+        # 运单清单（带客户单号）
         waybills = brow.get("运单清单_list", []) or []
         waybills_disp = []
         for wb in waybills:
             wb_norm = _norm_waybill_str(wb)
             cust = cust_map.get(wb_norm, "")
             waybills_disp.append(f"{wb}({cust})" if cust else f"{wb}")
-        sub = df_join[(df_join["托盘号"] == pid) & (df_join["仓库代码"] == wh)]
 
+        # 解析创建日期/时间为可读字符串
+        create_date_str, create_time_str = _split_dt_to_date_time_str(
+            brow.get("托盘创建日期_raw", ""),
+            brow.get("托盘创建时间_raw", "")
+        )
+
+        # 汇总各运单的 ETA/ATA、ETD/ATD、承诺时段&差值
+        sub = df_join[(df_join["托盘号"] == pid) & (df_join["仓库代码"] == wh)]
         lines_etaata, lines_etdatd, promised = [], [], []
         diffs_days = []
         for _, r in sub.iterrows():
@@ -377,7 +630,7 @@ def load_pallet_detail_df():
                     return 10**9
             diff_days_str = sorted(diffs_days, key=keyfn)[0]
 
-        # 加入 L/W/H（四舍五入到 2 位，仅显示）
+        # L/W/H（仅显示）
         L_in = brow.get("托盘长in", None)
         W_in = brow.get("托盘宽in", None)
         H_in = brow.get("托盘高in", None)
@@ -390,6 +643,9 @@ def load_pallet_detail_df():
             "长(in)": round(float(L_in), 2) if pd.notna(L_in) else None,
             "宽(in)": round(float(W_in), 2) if pd.notna(W_in) else None,
             "高(in)": round(float(H_in), 2) if pd.notna(H_in) else None,
+            # ✅ 解析后的创建时间（可读）
+            "托盘创建日期": create_date_str,
+            "托盘创建时间": create_time_str,
             "运单数量": len(waybills),
             "运单清单": ", ".join(waybills_disp) if waybills_disp else "",
             "对客承诺送仓时间": promised_str,
@@ -403,7 +659,17 @@ def load_pallet_detail_df():
         return out
 
     # 过滤空托盘号
-    out = out[out["托盘号"].astype(str).str.strip() != ""]
+    out = out[out["托盘号"].astype(str).str.strip() != ""].copy()
+
+    # 数值保留两位（仅显示用）
+    for c in ["托盘体积","托盘重量","长(in)","宽(in)","高(in)"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    out["托盘体积"] = out["托盘体积"].round(2)
+    out["长(in)"] = out["长(in)"].round(2)
+    out["宽(in)"] = out["宽(in)"].round(2)
+    out["高(in)"] = out["高(in)"].round(2)
+
     return out
 
 
@@ -572,7 +838,7 @@ def load_customer_refs_from_pallet():
     out = out[out["运单号"]!=""].drop_duplicates(subset=["运单号"])
     return out[["运单号","客户单号"]]
 
-# ===================== REPLACEMENT START =====================
+# ===================== 运单增量构建 =====================
 def _extract_pure_waybills(mixed: str) -> list[str]:
     """
     从《发货追踪》的“运单清单”字段中提取纯运单号列表。
@@ -583,45 +849,28 @@ def _extract_pure_waybills(mixed: str) -> list[str]:
       - 混合分隔符：逗号/分号/斜杠/竖线/空白/中文标点
     额外防呆：
       - 丢弃以 'IP' 开头的片段（客户PO）
-      - 丢弃纯数字/纯字母或长度太短的片段
+      - 丢弃不含字母或数字/长度太短的片段
     """
     if _is_blank(mixed):
         return []
-
     s = str(mixed).strip()
-
-    # 1) 先整体剥离括号内内容（跨行非贪婪），避免括号里的 IP... 被当成独立 token
-    #    支持中/英文括号；DOTALL 允许匹配换行
     s_no_paren = re.sub(r"[\(\（][\s\S]*?[\)\）]", "", s, flags=re.DOTALL).strip()
-
     if not s_no_paren:
         return []
-
-    # 2) 再进行分割
     parts = re.split(r"[,\，;\；、\|\/\s]+", s_no_paren)
-
-    # 3) 逐个规范化 & 过滤
     out = []
     for p in parts:
         if not p:
             continue
         token = _norm_waybill_str(p)
-
         if not token:
             continue
-        # 丢弃以 'IP' 开头（典型客户PO）
         if token.upper().startswith("IP"):
             continue
-        # 丢弃明显不像运单号的片段（可按需放宽/收紧）
-        # 规则：必须包含字母+数字的组合，且长度≥8
         if not (re.search(r"[A-Za-z]", token) and re.search(r"\d", token) and len(token) >= 8):
             continue
-
         out.append(token)
-
     return out
-
-
 
 def build_waybill_delta():
     """
@@ -706,7 +955,7 @@ def build_waybill_delta():
         out["到港(ETA/ATA)"] = pd.NA
         out["到仓日期"]       = pd.NA
 
-    # 客户单号合并逻辑（略，同之前）
+    # 客户单号合并
     cust_bol = bol[["运单号","客户单号"]] if (not bol.empty and "客户单号" in bol.columns) \
                else pd.DataFrame(columns=["运单号","客户单号"])
     cust_pal = load_customer_refs_from_pallet()
@@ -752,18 +1001,13 @@ def build_waybill_delta():
             out[c] = pd.NA
     return out[final_cols]
 
-# ===================== REPLACEMENT END =====================
-
-
 def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
     target_cols = [
-    "客户单号","仓库代码","收费重","体积",
-    "发出(ETD/ATD)","到港(ETA/ATA)",
-    "到BCF日期","到BCF卡车号","到BCF费用",
-    "发走日期","发走卡车号","发走费用"
-]
-
-
+        "客户单号","仓库代码","收费重","体积",
+        "发出(ETD/ATD)","到港(ETA/ATA)",
+        "到BCF日期","到BCF卡车号","到BCF费用",
+        "发走日期","发走卡车号","发走费用"
+    ]
     try:
         ws = client.open(SHEET_WB_SUMMARY).sheet1
     except SpreadsheetNotFound:
@@ -809,11 +1053,9 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
         new_rows = pd.DataFrame(index=new_keys, columns=cols_without_wb).fillna("")
         new_rows.index.name = "运单号"
         new_rows = new_rows.reset_index()
-
         base_delta = df_delta.set_index("运单号")
         for col in [c for c in target_cols if c in base_delta.columns]:
             new_rows.loc[:, col] = base_delta.reindex(new_rows["运单号"])[col].values
-
         exist = pd.concat([exist_idx.reset_index(drop=True), new_rows.reindex(columns=header_new)], ignore_index=True)
     else:
         exist = exist_idx.reset_index(drop=True)
@@ -872,10 +1114,11 @@ wh_pick = st.selectbox("选择仓库代码（可选）", options=wh_opts, key="w
 if wh_pick != "（全部）":
     pallet_df = pallet_df[pallet_df["仓库代码"]==wh_pick]
 
-# 表格与勾选
 # ----------------------- 表格与勾选（防抖版） -----------------------
 show_cols = [
     "托盘号","仓库代码","托盘重量","长(in)","宽(in)","高(in)","托盘体积",
+    # 新增展示列
+    "托盘创建日期","托盘创建时间",
     "运单数量","运单清单",
     "对客承诺送仓时间","送仓时段差值(天)",
     "ETA/ATA(按运单)","ETD/ATD(按运单)"
@@ -923,12 +1166,11 @@ if not st.session_state.sel_locked:
         if len(selected_pal) == 0:
             st.warning("请至少勾选一个托盘再点击『锁定选择并进入计算』。")
             st.stop()
-        # 锁定选择 + 保存一次全表快照（含“选择”列置顶的视图）
+        # 锁定选择 + 保存一次全表快照
         st.session_state.locked_df = selected_pal.reset_index(drop=True)
-        st.session_state.all_snapshot_df = disp_df[cols_order].copy()  # ← 新增：用锁定瞬间的全量数据做快照
+        st.session_state.all_snapshot_df = disp_df[cols_order].copy()
         st.session_state.sel_locked = True
         st.rerun()
-
 
 # ========== 计算阶段（基于已锁定的选择，同时显示未锁定的托盘）==========
 if st.session_state.sel_locked:
@@ -942,14 +1184,11 @@ if st.session_state.sel_locked:
     # 已锁定托盘
     selected_pal = st.session_state.locked_df.copy()
     # 其余未锁定托盘（只读展示）
-    # 注意：这里依赖上文的 disp_df 和 cols_order（["选择"] + show_cols）
     locked_ids = set(selected_pal["托盘号"].astype(str))
     others_df = disp_df[~disp_df["托盘号"].astype(str).isin(locked_ids)].copy()
-    # 只读表里把“选择”列固定为 False（避免误导）
     if "选择" in others_df.columns:
         others_df["选择"] = False
 
-    # 两块并排展示：左=已锁定，右=未锁定（只读）
     left, right = st.columns([2, 2], gap="large")
 
     with left:
@@ -981,7 +1220,7 @@ if st.session_state.sel_locked:
         st.info("当前没有锁定的托盘。点击『重新选择』返回。")
         st.stop()
 
-    # 车次信息（分摊按“托盘重量”）——以下保持你原逻辑
+    # 车次信息（分摊按“托盘重量”）
     st.subheader("🧾 车次信息（托盘维度分摊）")
     cc1, cc2 = st.columns([2,2])
     with cc1:
@@ -1022,6 +1261,8 @@ if st.session_state.sel_locked:
 
     preview_cols_pal = [
         "卡车单号","仓库代码","托盘号","托盘重量","长(in)","宽(in)","高(in)","托盘体积",
+        # 同步在预览也看得到创建时间（只读展示，不写发货追踪）
+        "托盘创建日期","托盘创建时间",
         "运单数量","运单清单",
         "对客承诺送仓时间","送仓时段差值(天)",
         "ETA/ATA(按运单)","ETD/ATD(按运单)",
@@ -1040,8 +1281,7 @@ if st.session_state.sel_locked:
     （最后一托盘自动调整几分钱差额，确保总额=本车总费用）
     """)
 
-
-    # 上传按钮（原逻辑保持）
+    # 上传按钮
     if st.button("📤 追加上传到『发货追踪』", key="btn_upload_pallet"):
         try:
             ss = client.open(SHEET_SHIP_TRACKING); ws_track = ss.sheet1
@@ -1058,7 +1298,7 @@ if st.session_state.sel_locked:
         header_norm = _norm_header(header_raw)
         header_norm_lower = [h.lower() for h in header_norm]
         need_ok = any(n in header_norm for n in ["托盘号","托盘编号"]) or \
-                any(n in header_norm_lower for n in ["palletid","palletno","pallet编号"])
+                  any(n in header_norm_lower for n in ["palletid","palletno","pallet编号"])
         if not need_ok:
             st.error("『发货追踪』缺少“托盘号”列（或等价列如 PalletID/PalletNo）。请先在目标表增加该列。")
             st.stop()
@@ -1071,11 +1311,11 @@ if st.session_state.sel_locked:
             if col not in tmp.columns:
                 tmp[col] = ""
         rows = tmp.reindex(columns=header_raw).fillna("").values.tolist()
-
         ws_track.append_rows(rows, value_input_option="USER_ENTERED")
 
         st.success(f"已上传 {len(rows)} 条到『{SHEET_SHIP_TRACKING}』。卡车单号：{pallet_truck_no}")
 
+        # 更新『运单全链路汇总』
         try:
             st.info("正在更新『运单全链路汇总』（只含『发货追踪』里的运单；仅更新指定列）…")
             df_delta = build_waybill_delta()
@@ -1090,11 +1330,10 @@ if st.session_state.sel_locked:
         except Exception as e:
             st.warning(f"更新『运单全链路汇总』失败：{e}")
 
-        # 仅在上传成功后清缓存/解锁，避免操作中断导致的刷新
+        # 上传成功后清缓存/解锁
         st.cache_data.clear()
         st.session_state.sel_locked = False
         st.session_state.locked_df = pd.DataFrame()
         st.session_state.pop("pallet_select_editor", None)
         st.rerun()
 # ----------------------- 选择与计算片段结束 -----------------------
-
