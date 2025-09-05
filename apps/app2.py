@@ -211,87 +211,174 @@ def load_arrivals_df():
 @st.cache_data(ttl=60)
 def load_pallet_detail_df():
     """
-    托盘维度：从《托盘明细表》聚合，并与《到仓数据表》匹配时间/承诺字段
-    - 托盘重量：仅来自托盘明细，按托盘求和
-    - 托盘体积（CBM）：由 L/W/H(inch) 计算（每个托盘仅计算一次体积，取该托盘组内第一组有效 L/W/H）
-    - 同时输出每托盘的“长(in)/宽(in)/高(in)”（各取首个有效值，仅用于显示）
-    - ETA/ATA 使用“合并列”（来自到仓表），展示为 'ETA/ATA yyyy-mm-dd'
+    分块读取《托盘明细表》→ 汇总到托盘维度：
+    - 仅取必要列（托盘号/仓库代码/运单号 + 可能的重量/长宽高）
+    - 逐块读取，遇到连续 EMPTY_LIMIT 行空行即提早停止
+    - 全程带重试，避免 429/5xx
     """
-    ws = client.open(SHEET_PALLET_DETAIL).sheet1
-    vals = ws.get_all_values(
-        value_render_option="UNFORMATTED_VALUE",
-        date_time_render_option="SERIAL_NUMBER"
-    )
-    if not vals:
+    # --- 基础：打开 sheet（优先你已有的 get_ws；没有则回退 client.open） ---
+    try:
+        try:
+            ws = get_ws(SHEET_PALLET_DETAIL, "pallet_detail_key")  # 若你已实现 get_ws
+        except NameError:
+            ws = client.open(SHEET_PALLET_DETAIL).sheet1
+    except SpreadsheetNotFound:
         return pd.DataFrame()
 
-    header = _norm_header(vals[0])
-    df = pd.DataFrame(vals[1:], columns=header)
+    # --- 小工具 ---
+    def _col_letter(n: int) -> str:
+        """1->A, 2->B ..."""
+        s = ""
+        while n:
+            n, r = divmod(n-1, 26)
+            s = chr(r + 65) + s
+        return s
+
+    def _norm_cols(cols):
+        return [c.replace("\u00A0"," ").replace("\n","").strip().replace(" ","") for c in cols]
+
+    def _get_range(r1, c1, r2, c2):
+        """A1 区间"""
+        return f"{_col_letter(c1)}{r1}:{_col_letter(c2)}{r2}"
+
+    # --- 读取表头（只读第1行）---
+    header_row = _retry(ws.get_values, "1:1") or [[]]
+    raw_header = header_row[0] if header_row else []
+    header = _norm_cols(raw_header)
+    if not header:
+        return pd.DataFrame()
+
+    # 需要的列名集合（尽量覆盖常见别名）
+    # 关键必需：托盘号/仓库代码/运单号
+    alias = {
+        "托盘号": ["托盘号","托盘ID","托盘编号","PalletID","PalletNo","palletid","palletno"],
+        "仓库代码": ["仓库代码","仓库","WH","Warehouse","warehouse"],
+        "运单号": ["运单号","Waybill","waybill","运单编号"],
+        "托盘重量": ["托盘重量","托盘重","收费重","托盘收费重","计费重","计费重量","重量"],
+        "托盘长": ["托盘长","长","长度","Length","length","L"],
+        "托盘宽": ["托盘宽","宽","宽度","Width","width","W"],
+        "托盘高": ["托盘高","高","高度","Height","height","H"],
+    }
+
+    # 把需要的列映射到索引（1-based for A1），若没找到就跳过（非必需）
+    col_map = {}
+    for key, names in alias.items():
+        for nm in names:
+            nm_norm = nm.replace(" ","")
+            if nm_norm in header:
+                col_map[key] = header.index(nm_norm) + 1  # 1-based
+                break
+
+    # 必需列检查
+    for must in ["托盘号","仓库代码","运单号"]:
+        if must not in col_map:
+            # 尝试最基础的列名再搜一次
+            if must in header:
+                col_map[must] = header.index(must) + 1
+            else:
+                # 没有关键列，直接返回空
+                return pd.DataFrame()
+
+    # 计算需要读取的最小列区间
+    need_cols = [col_map[k] for k in col_map.keys()]
+    c1, c2 = min(need_cols), max(need_cols)
+
+    # --- 分块读取 ---
+    CHUNK = 2000          # 每次 2000 行
+    START_ROW = 2         # 从第 2 行开始（第 1 行是表头）
+    MAX_ROWS = 200000     # 硬上限，避免意外
+    EMPTY_LIMIT = 200     # 连续空行阈值，到达就提前停止
+
+    rows = []
+    empty_streak = 0
+    cur = START_ROW
+    last_row = min(START_ROW + MAX_ROWS - 1, START_ROW + MAX_ROWS - 1)
+
+    while cur <= last_row:
+        end = min(cur + CHUNK - 1, last_row)
+        rng = _get_range(cur, c1, end, c2)  # 只拉必要列
+        chunk = _retry(ws.get_values, rng, major_dimension="ROWS") or []
+
+        if not chunk:
+            empty_streak += (end - cur + 1)
+            if empty_streak >= EMPTY_LIMIT:
+                break
+            cur = end + 1
+            continue
+
+        for row in chunk:
+            # 右侧补齐到列宽
+            if len(row) < (c2 - c1 + 1):
+                row = row + [""] * ((c2 - c1 + 1) - len(row))
+            # 判断是否“空行”
+            if all((str(x).strip() == "") for x in row):
+                empty_streak += 1
+                if empty_streak >= EMPTY_LIMIT:
+                    break
+                continue
+            else:
+                empty_streak = 0
+
+            rows.append(row)
+        if empty_streak >= EMPTY_LIMIT:
+            break
+        cur = end + 1
+
+    if not rows:
+        return pd.DataFrame()
+
+    # --- 构造成数据框（只含必要列，按逻辑补齐命名）---
+    # 建立“索引 → 标准列名”的逆映射
+    idx_to_name = {}
+    for std_name, idx1 in col_map.items():
+        idx_to_name[idx1 - c1] = std_name  # 相对区间起点的偏移
+
+    data = []
+    for r in rows:
+        rec = {}
+        for i, v in enumerate(r):
+            if i in idx_to_name:
+                rec[idx_to_name[i]] = v
+        data.append(rec)
+
+    df = pd.DataFrame(data)
 
     # 兜底关键列
-    if "托盘号" not in df.columns:
-        for cand in ["托盘ID","托盘编号","PalletID","PalletNo","palletid","palletno"]:
-            if cand in df.columns:
-                df = df.rename(columns={cand: "托盘号"})
-                break
-    if "托盘号" not in df.columns:
-        df["托盘号"] = pd.NA
+    for k in ["托盘号","仓库代码","运单号"]:
+        if k not in df.columns:
+            df[k] = pd.NA
 
-    if "仓库代码" not in df.columns:
-        df["仓库代码"] = pd.NA
-
-    if "运单号" not in df.columns:
-        for cand in ["Waybill","waybill","运单编号"]:
-            if cand in df.columns:
-                df = df.rename(columns={cand: "运单号"})
-                break
-    if "运单号" not in df.columns:
-        df["运单号"] = pd.NA
-
-    # 规范
+    # 规范化
     df["托盘号"] = df["托盘号"].astype(str).str.strip()
     df["仓库代码"] = df["仓库代码"].astype(str).str.strip()
     df["运单号"] = df["运单号"].apply(_norm_waybill_str)
 
-    # 识别重量列（来自托盘明细）
-    weight_col = None
-    for cand in ["托盘重量","托盘重","收费重","托盘收费重","计费重","计费重量","重量"]:
-        if cand in df.columns:
-            weight_col = cand
-            break
-    if weight_col is None:
+    # 数值列
+    if "托盘重量" in df.columns:
+        df["托盘重量"] = pd.to_numeric(df["托盘重量"], errors="coerce")
+    else:
         df["托盘重量"] = pd.NA
-        weight_col = "托盘重量"
-    df[weight_col] = pd.to_numeric(df[weight_col], errors="coerce")
 
-    # 识别 L/W/H（inch）
-    len_col = next((c for c in ["托盘长","长","长度","Length","length","L"] if c in df.columns), None)
-    wid_col = next((c for c in ["托盘宽","宽","宽度","Width","width","W"] if c in df.columns), None)
-    hei_col = next((c for c in ["托盘高","高","高度","Height","height","H"] if c in df.columns), None)
+    # L/W/H（inch）→ 体积（仅取该托盘第一组有效 L/W/H）
+    for nm in ["托盘长","托盘宽","托盘高"]:
+        if nm in df.columns:
+            df[nm] = pd.to_numeric(df[nm], errors="coerce")
 
     INCH_TO_M = 0.0254
-
     def _cbm_row(r):
-        if not all([len_col, wid_col, hei_col]):
-            return None
         try:
-            L = float(pd.to_numeric(r.get(len_col), errors="coerce"))
-            W = float(pd.to_numeric(r.get(wid_col), errors="coerce"))
-            H = float(pd.to_numeric(r.get(hei_col), errors="coerce"))
+            L = float(r.get("托盘长", float("nan")))
+            W = float(r.get("托盘宽", float("nan")))
+            H = float(r.get("托盘高", float("nan")))
             if L > 0 and W > 0 and H > 0:
                 return (L * W * H) * (INCH_TO_M ** 3)
         except Exception:
             pass
         return None
 
-    # 行级体积（只为后续“取该托盘第一条有效体积”做准备）
     df["_cbm_row"] = df.apply(_cbm_row, axis=1)
 
-    # 聚合到托盘
-    def _first_valid(s):
-        s_num = pd.to_numeric(s, errors="coerce").dropna()
-        return float(s_num.iloc[0]) if len(s_num) > 0 else None
-
+    # 分组聚合到“托盘维度”
     def _first_valid_num(s):
         s_num = pd.to_numeric(s, errors="coerce").dropna()
         return float(s_num.iloc[0]) if len(s_num) > 0 else None
@@ -300,50 +387,51 @@ def load_pallet_detail_df():
         vals = [x for x in s if isinstance(x, str) and x.strip()]
         return vals
 
-    # 动态构造聚合字典
     agg_dict = {
-        "托盘重量": (weight_col, lambda s: pd.to_numeric(s, errors="coerce").dropna().sum()),
-        "托盘体积": ("_cbm_row", _first_valid),  # 每托盘仅取第一条有效体积
+        "托盘重量": ("托盘重量", lambda s: pd.to_numeric(s, errors="coerce").dropna().sum()),
+        "托盘体积": ("_cbm_row", _first_valid_num),
         "运单清单_list": ("运单号", _wb_list),
     }
-    if len_col:
-        agg_dict["托盘长in"] = (len_col, _first_valid_num)
-    if wid_col:
-        agg_dict["托盘宽in"] = (wid_col, _first_valid_num)
-    if hei_col:
-        agg_dict["托盘高in"] = (hei_col, _first_valid_num)
+    if "托盘长" in df.columns: agg_dict["托盘长in"] = ("托盘长", _first_valid_num)
+    if "托盘宽" in df.columns: agg_dict["托盘宽in"] = ("托盘宽", _first_valid_num)
+    if "托盘高" in df.columns: agg_dict["托盘高in"] = ("托盘高", _first_valid_num)
 
     base = (
         df.groupby(["托盘号", "仓库代码"], as_index=False, dropna=False)
           .agg(**agg_dict)
     )
 
-    # 与到仓数据合并以生成展示字符串
-    arrivals = load_arrivals_df()  # 需要：ETA/ATA, ETD/ATD, 对客承诺送仓时间, _ETAATA_date
+    # 合并时间/承诺信息（来自到仓表）
+    arrivals = load_arrivals_df()
     df_join = df.merge(
         arrivals[["运单号", "ETA/ATA", "ETD/ATD", "对客承诺送仓时间", "_ETAATA_date"]],
         on="运单号", how="left"
     )
+
+    # 客户单号（从自提明细）
     bol_cust_df = load_bol_waybill_costs()
     cust_map = {}
     if not bol_cust_df.empty and "运单号" in bol_cust_df.columns and "客户单号" in bol_cust_df.columns:
-        # 仅使用自提明细来源（用户要求）
         for _, rr in bol_cust_df.iterrows():
             wb = _norm_waybill_str(rr.get("运单号", ""))
             cust = str(rr.get("客户单号", "")).strip()
             if wb and cust:
                 cust_map[wb] = cust
+
     pallets = []
     for _, brow in base.iterrows():
         pid, wh = brow["托盘号"], brow["仓库代码"]
         p_wt = brow.get("托盘重量", None)
         p_vol = brow.get("托盘体积", None)
         waybills = brow.get("运单清单_list", []) or []
+
+        # 展示“运单清单”
         waybills_disp = []
         for wb in waybills:
             wb_norm = _norm_waybill_str(wb)
             cust = cust_map.get(wb_norm, "")
             waybills_disp.append(f"{wb}({cust})" if cust else f"{wb}")
+
         sub = df_join[(df_join["托盘号"] == pid) & (df_join["仓库代码"] == wh)]
 
         lines_etaata, lines_etdatd, promised = [], [], []
@@ -359,37 +447,30 @@ def load_pallet_detail_df():
             lines_etdatd.append(f"{wb}: {'' if _is_blank(etdatd_s) else str(etdatd_s)}")
 
             if not _is_blank(promise):
+                # 复用你现有的差值逻辑
                 diffs_days.append(_promise_diff_days_str(str(promise).strip(), anchor or date.today()))
                 promised.append(str(promise).strip())
 
         readable_etaata = " ; ".join(lines_etaata) if lines_etaata else ""
         readable_etdatd = " ; ".join(lines_etdatd) if lines_etdatd else ""
-        promised_set = list(dict.fromkeys([p for p in promised if p]))
-        promised_str = " , ".join(promised_set)
+        promised_str = " , ".join(list(dict.fromkeys([p for p in promised if p])))
 
-        diff_days_str = ""
-        if diffs_days:
-            def keyfn(s):
-                try:
-                    a, _ = s.split("-", 1)
-                    return int(a)
-                except Exception:
-                    return 10**9
-            diff_days_str = sorted(diffs_days, key=keyfn)[0]
-
-        # 加入 L/W/H（四舍五入到 2 位，仅显示）
-        L_in = brow.get("托盘长in", None)
-        W_in = brow.get("托盘宽in", None)
-        H_in = brow.get("托盘高in", None)
+        def _keyfn(s):
+            try:
+                a, _ = s.split("-", 1)
+                return int(a)
+            except Exception:
+                return 10**9
+        diff_days_str = sorted(diffs_days, key=_keyfn)[0] if diffs_days else ""
 
         pallets.append({
             "托盘号": pid,
             "仓库代码": wh,
             "托盘重量": float(p_wt) if pd.notna(p_wt) else None,
-            "托盘体积": float(p_vol) if p_vol is not None else None,  # m³
-            "长(in)": round(float(L_in), 2) if pd.notna(L_in) else None,
-            "宽(in)": round(float(W_in), 2) if pd.notna(W_in) else None,
-            "高(in)": round(float(H_in), 2) if pd.notna(H_in) else None,
+            "托盘体积": float(p_vol) if p_vol is not None else None,
+            "长(in)": round(float(brow.get("托盘长in", None)), 2) if pd.notna(brow.get("托盘长in", None)) else None,
+            "宽(in)": round(float(brow.get("托盘宽in", None)), 2) if pd.notna(brow.get("托盘宽in", None)) else None,
+            "高(in)": round(float(brow.get("托盘高in", None)), 2) if pd.notna(brow.get("托盘高in", None)) else None,
             "运单数量": len(waybills),
             "运单清单": ", ".join(waybills_disp) if waybills_disp else "",
             "对客承诺送仓时间": promised_str,
@@ -401,10 +482,8 @@ def load_pallet_detail_df():
     out = pd.DataFrame(pallets)
     if out.empty:
         return out
+    return out[out["托盘号"].astype(str).str.strip() != ""]
 
-    # 过滤空托盘号
-    out = out[out["托盘号"].astype(str).str.strip() != ""]
-    return out
 
 
 @st.cache_data(ttl=60)
