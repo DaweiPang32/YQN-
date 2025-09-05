@@ -42,6 +42,38 @@ SHEET_BOL_DETAIL      = "bol自提明细"      # 到BCF 明细（分摊到运单
 SHEET_WB_SUMMARY      = "运单全链路汇总"    # 仅部分更新：客户单号/ETD/ETA/到BCF/发走相关列
 
 # ========= 基础工具 =========
+# === fast sheet open + retry helpers (ADD) ===
+import time
+from gspread.exceptions import APIError
+
+def get_ws(sheet_title: str, secret_key_name: str | None = None):
+    """
+    优先用 secrets 里的 xxx_key 打开（open_by_key 快 & 稳定）
+    回退到按标题打开（仅当没配 key 时）。
+    """
+    key = ""
+    try:
+        key = st.secrets.get(secret_key_name, "").strip()
+    except Exception:
+        key = ""
+    if key:
+        ss = client.open_by_key(key)
+    else:
+        ss = client.open(sheet_title)
+    return ss.sheet1
+
+def _retry(fn, *args, _retries=5, _base=0.6, _factor=1.8, _max_sleep=6.0, **kwargs):
+    """指数退避重试：专治 429/5xx"""
+    for i in range(_retries):
+        try:
+            return fn(*args, **kwargs)
+        except APIError as e:
+            code = getattr(e, "response", None).status_code if getattr(e, "response", None) else None
+            if code in (429, 500, 502, 503, 504):
+                time.sleep(min(_base * (_factor ** i), _max_sleep))
+                continue
+            raise
+
 def _norm_header(cols):
     return [c.replace("\u00A0"," ").replace("\n","").strip().replace(" ","") for c in cols]
 
