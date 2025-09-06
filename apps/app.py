@@ -653,10 +653,10 @@ if st.session_state["pallet_detail_records"]:
                 kept = [r for i, r in enumerate(updated_records) if i not in to_delete_idx]
                 st.session_state["pallet_detail_records"] = kept
                 st.success(f"已删除 {len(to_delete_idx)} 条记录")
-                st.rerun()            else:
+                st.rerun()
+            else:
                 st.info("未勾选要删除的记录。")
 
-    st.markdown("---")
 
     # ========== 上传托盘明细到 Google Sheets ==========
     c1, c2, _ = st.columns([2, 2, 6])
