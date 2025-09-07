@@ -537,13 +537,15 @@ def load_pallet_detail_df():
 
     # === 聚合到托盘 ===
     agg_dict = {
-        "托盘重量": (weight_col, lambda s: pd.to_numeric(s, errors="coerce").dropna().sum()),
-        "托盘体积": ("_cbm_row", _first_valid_num),  # 每托盘仅取第一条有效体积
+        # ✅ 每个托盘只取一次重量，避免同托盘多运单导致累加
+        "托盘重量": (weight_col, _first_valid_num),
+        # 体积仍然只取一次（你已这样做）
+        "托盘体积": ("_cbm_row", _first_valid_num),
         "运单清单_list": ("运单号", _wb_list),
-        # 创建日期/时间取首个非空原始值（稍后统一解析）
         "托盘创建日期_raw": (create_date_col, _first_nonblank_str),
         "托盘创建时间_raw": (create_time_col, _first_nonblank_str),
     }
+
     if len_col:
         agg_dict["托盘长in"] = (len_col, _first_valid_num)
     if wid_col:
