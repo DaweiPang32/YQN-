@@ -174,12 +174,22 @@ def _coerce_excel_serial_sum(v):
 
 def _parse_sheet_value_to_date(v):
     """
-    更强健的“值 -> 日期(date)”解析：
-    1) 先把 v 合并成 Excel/GS 天数（含小数），成功则按序列转换（丢弃时间部分）
-    2) 不行再尝试数值范围/时间戳
-    3) 最后用 pandas 兜底
+    更安全的值 -> 日期(date) 解析：
+    优先直接解析“看起来像日期/日期时间”的字符串；仅在确实像 Excel/GS 序列数时才按序列换算。
     """
-    # ① 合并“日期+时间片段”
+    # 先处理空值
+    if _is_blank(v):
+        return None
+
+    # 1) 如果是“明显日期字符串”（含 - / 年月日 等），优先直接解析
+    if isinstance(v, str):
+        s = v.strip()
+        if any(tok in s for tok in ["-", "/", "年", "月", "日", ":"]):
+            dt = pd.to_datetime(s, errors="coerce")
+            if pd.notna(dt):
+                return dt.date()
+
+    # 2) 纯数字 / 含小数 或者 “序列拼接”的情况，才尝试按 Excel/GS 序列解析
     serial = _coerce_excel_serial_sum(v)
     if serial is not None:
         try:
@@ -188,29 +198,46 @@ def _parse_sheet_value_to_date(v):
         except Exception:
             pass
 
-    # ② 退路：原数值路径
-    if _is_blank(v):
-        return None
-    n = _to_num(v)
-    if n is not None:
-        if 30000 <= n <= 80000:
-            return (_BASE + timedelta(days=n)).date()
-        if 80000 < n < 200000:
-            return (_BASE + timedelta(days=n/2.0)).date()
-        if 1e9 <= n < 2e10:           # 秒时间戳
-            try: return datetime.utcfromtimestamp(n).date()
-            except: pass
-        if 1e12 <= n < 2e13:          # 毫秒时间戳
-            try: return datetime.utcfromtimestamp(n/1000.0).date()
-            except: pass
-        try: return (_BASE + timedelta(days=n)).date()
-        except: pass
-
-    # ③ pandas 兜底
+    # 3) 兜底：再尝试一次通用解析（覆盖时间戳等）
     try:
         dt = pd.to_datetime(v, errors="coerce")
-        if pd.isna(dt): return None
+        if pd.isna(dt):
+            return None
         return dt.date()
+    except Exception:
+        return None
+
+
+def _excel_serial_to_dt(v):
+    """
+    将任意形态的 Excel/GS 序列数或“明显的日期/时间字符串”转为 datetime。
+    优先解析“像日期/时间的字符串”；仅当像序列数时再按基准日换算。
+    """
+    if _is_blank(v):
+        return None
+
+    # 1) 优先：字符串像日期/时间就直接解析
+    if isinstance(v, str):
+        s = v.strip()
+        if any(tok in s for tok in ["-", "/", "年", "月", "日", ":"]):
+            ts = pd.to_datetime(s, errors="coerce")
+            if pd.notna(ts):
+                return ts.to_pydatetime()
+
+    # 2) 尝试作为序列数（含 "45905 0.6855" 这类）
+    serial = _coerce_excel_serial_sum(v)
+    if serial is not None:
+        try:
+            return _BASE + timedelta(days=float(serial))
+        except Exception:
+            pass
+
+    # 3) 兜底再试一次通用解析（时间戳等）
+    try:
+        ts = pd.to_datetime(v, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.to_pydatetime()
     except Exception:
         return None
 
@@ -247,30 +274,7 @@ def _promise_diff_days_str(win: str, anchor: date | None):
     x = (start_d - today).days
     y2 = (end_d   - today).days
     return f"{x}-{y2}"
-def _excel_serial_to_dt(v):
-    """
-    将任意形态的 Excel/GS 序列（含小数）或带有数字的字符串转为 datetime（含日期与时间）。
-    - 支持 '45905 0.6855'、'45905,0.6855'、列表 [45905, 0.6855] 等
-    - 返回 datetime 或 None
-    """
-    serial = _coerce_excel_serial_sum(v)
-    if serial is None:
-        # 再试：直接解析时间字符串（如 '14:25'）
-        try:
-            ts = pd.to_datetime(str(v), errors="coerce")
-            if pd.isna(ts):
-                return None
-            # 若只有时间而无日期，则用今天的日期
-            if ts.year < 1900:
-                base = datetime.combine(date.today(), ts.time())
-                return base
-            return ts.to_pydatetime()
-        except Exception:
-            return None
-    try:
-        return _BASE + timedelta(days=float(serial))
-    except Exception:
-        return None
+
 
 def _fmt_time_from_any(v, out_fmt="%H:%M"):
     """
@@ -398,55 +402,6 @@ def load_pallet_detail_df():
     - ETA/ATA 使用“合并列”（来自到仓表），展示为 'ETA/ATA yyyy-mm-dd'
     - 新增：聚合《托盘明细表》中提交时写入的“托盘创建日期/托盘创建时间”（解析为 YYYY-MM-DD / HH:MM）
     """
-    # === 内部仅供本函数使用的小工具（依赖全局 _BASE / _coerce_excel_serial_sum）===
-    def _excel_serial_to_dt(v):
-        """将 Excel/GS 序列（含小数）或带数字的字符串转为 datetime；失败返回 None。"""
-        serial = _coerce_excel_serial_sum(v)
-        if serial is None:
-            # 兜底：尝试直接解析字符串时间（如 '14:25'）
-            try:
-                ts = pd.to_datetime(str(v), errors="coerce")
-                if pd.isna(ts):
-                    return None
-                # 只有时间而无日期时（年份异常），给今天日期
-                if ts.year < 1900:
-                    return datetime.combine(date.today(), ts.time())
-                return ts.to_pydatetime()
-            except Exception:
-                return None
-        try:
-            return _BASE + timedelta(days=float(serial))
-        except Exception:
-            return None
-
-    def _split_dt_to_date_time_str(date_raw, time_raw):
-        """
-        智能从“日期列/时间列”提取最终的日期字符串与时间字符串（24h HH:MM）。
-        优先：
-          1) 从 date_raw 中解析到日期；若其中带小数时间也可用于 time
-          2) 从 time_raw 中解析时间；若空则回退到 date_raw 的时间部分
-        """
-        d_dt = _excel_serial_to_dt(date_raw)
-        t_dt = _excel_serial_to_dt(time_raw)
-
-        # 日期
-        if isinstance(d_dt, datetime):
-            date_str = d_dt.date().strftime("%Y-%m-%d")
-        elif isinstance(t_dt, datetime):
-            date_str = date.today().strftime("%Y-%m-%d")
-        else:
-            date_str = ""
-
-        # 时间
-        if isinstance(t_dt, datetime):
-            time_str = t_dt.strftime("%H:%M")
-        elif isinstance(d_dt, datetime):
-            time_str = d_dt.strftime("%H:%M")
-        else:
-            time_str = ""
-
-        return date_str, time_str
-    # === 小工具结束 ===
 
     ws = client.open(SHEET_PALLET_DETAIL).sheet1
     vals = ws.get_all_values(
@@ -1116,6 +1071,7 @@ wh_pick = st.selectbox("选择仓库代码（可选）", options=wh_opts, key="w
 if wh_pick != "（全部）":
     pallet_df = pallet_df[pallet_df["仓库代码"]==wh_pick]
 
+
 # ----------------------- 表格与勾选（防抖版） -----------------------
 show_cols = [
     "托盘号","仓库代码","托盘重量","长(in)","宽(in)","高(in)","托盘体积",
@@ -1339,3 +1295,4 @@ if st.session_state.sel_locked:
         st.session_state.pop("pallet_select_editor", None)
         st.rerun()
 # ----------------------- 选择与计算片段结束 -----------------------
+
