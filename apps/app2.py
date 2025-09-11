@@ -454,9 +454,18 @@ def load_pallet_detail_df():
     len_col = next((c for c in ["托盘长","长","长度","Length","length","L"] if c in df.columns), None)
     wid_col = next((c for c in ["托盘宽","宽","宽度","Width","width","W"] if c in df.columns), None)
     hei_col = next((c for c in ["托盘高","高","高度","Height","height","H"] if c in df.columns), None)
+        # 识别“箱数/数量”列（来自托盘明细；仅用于显示）
+    qty_col = next((c for c in [
+        "箱数","箱","件数","箱件数","Packages","Package","Cartons","Carton",
+        "Qty","QTY","数量"
+    ] if c in df.columns), None)
+    if qty_col is None:
+        df["箱数"] = pd.NA
+        qty_col = "箱数"
+    df[qty_col] = pd.to_numeric(df[qty_col], errors="coerce")
 
     INCH_TO_M = 0.0254
-
+    
     def _cbm_row(r):
         if not all([len_col, wid_col, hei_col]):
             return None
@@ -553,6 +562,28 @@ def load_pallet_detail_df():
             brow.get("托盘创建日期_raw", ""),
             brow.get("托盘创建时间_raw", "")
         )
+        # === 每托盘：统计该托盘内各运单的箱数（来自托盘明细） ===
+        sub_qty = df[(df["托盘号"] == pid) & (df["仓库代码"] == wh)].copy()
+        sub_qty["运单号_norm"] = sub_qty["运单号"].map(_norm_waybill_str)
+
+        # 对每个运单汇总箱数（允许同一托盘多行叠加）
+        qty_map = (
+            sub_qty.groupby("运单号_norm")[qty_col]
+                   .sum(min_count=1)  # 全是NaN则保持NaN
+                   .to_dict()
+        )
+
+        # 以“运单清单_list”的顺序生成展示，括号里放箱数；无箱数则用“-”
+        waybills_disp_qty = []
+        for wb in waybills:
+            wb_norm = _norm_waybill_str(wb)
+            q = qty_map.get(wb_norm, None)
+            if q is None or pd.isna(q):
+                q_str = "-"
+            else:
+                # 若是整数，显示为 int；否则保留两位
+                q_str = str(int(q)) if abs(q - round(q)) < 1e-9 else f"{q:.2f}"
+            waybills_disp_qty.append(f"{wb}({q_str})")
 
         # 汇总各运单的 ETA/ATA、ETD/ATD、承诺时段&差值
         sub = df_join[(df_join["托盘号"] == pid) & (df_join["仓库代码"] == wh)]
@@ -605,6 +636,7 @@ def load_pallet_detail_df():
             "托盘创建时间": create_time_str,
             "运单数量": len(waybills),
             "运单清单": ", ".join(waybills_disp) if waybills_disp else "",
+            "运单箱数": ", ".join(waybills_disp_qty) if waybills_disp_qty else "",
             "对客承诺送仓时间": promised_str,
             "送仓时段差值(天)": diff_days_str,
             "ETA/ATA(按运单)": readable_etaata,
@@ -1077,7 +1109,7 @@ show_cols = [
     "托盘号","仓库代码","托盘重量","长(in)","宽(in)","高(in)","托盘体积",
     # 新增展示列
     "托盘创建日期","托盘创建时间",
-    "运单数量","运单清单",
+    "运单数量","运单清单","运单箱数",
     "对客承诺送仓时间","送仓时段差值(天)",
     "ETA/ATA(按运单)","ETD/ATD(按运单)"
 ]
@@ -1295,4 +1327,5 @@ if st.session_state.sel_locked:
         st.session_state.pop("pallet_select_editor", None)
         st.rerun()
 # ----------------------- 选择与计算片段结束 -----------------------
+
 
