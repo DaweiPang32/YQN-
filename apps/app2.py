@@ -993,70 +993,164 @@ def build_waybill_delta():
             out[c] = pd.NA
     return out[final_cols]
 
+MANAGED_COLS = [
+    "运单号","客户单号","发出(ETD/ATD)","到港(ETA/ATA)",
+    "到BCF日期","发走日期","到仓日期","到BCF卡车号","到BCF费用",
+    "发走卡车号","发走费用","仓库代码","收费重","体积"
+]
+
+def _is_effective(v):
+    # 允许 0 / 0.0；禁止 None / NaN / 空串
+    if v is None: return False
+    if isinstance(v, float) and pd.isna(v): return False
+    if isinstance(v, str) and v.strip() == "": return False
+    return True
+
+def _to_jsonable_cell(v):
+    """把任意 DataFrame 值转成 Google Sheets 可接受且可 JSON 序列化的值。"""
+    try:
+        if v is None or pd.isna(v):
+            return ""
+    except Exception:
+        if v is None:
+            return ""
+
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        return "" if np.isnan(v) or np.isinf(v) else float(v)
+
+    if isinstance(v, float):
+        return "" if math.isnan(v) or math.isinf(v) else v
+
+    # 其它类型直接返回；非基础类型转成字符串更稳妥
+    return v if isinstance(v, (str, int, float, bool)) else str(v)
+
 def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
-    target_cols = [
-        "客户单号","仓库代码","收费重","体积",
-        "发出(ETD/ATD)","到港(ETA/ATA)",
-        "到BCF日期","到BCF卡车号","到BCF费用",
-        "发走日期","发走卡车号","发走费用"
-    ]
+    """
+    只对 MANAGED_COLS（白名单）做“定点值更新”或“追加新行”：
+    - ❌ 不清空整表（不调用 ws.clear()）
+    - ❌ 不写非白名单列（包括以后新增的任意列）
+    - ❌ 不写入空值（避免覆盖人工输入，如 'hi'）
+    - ✅ 需要时仅扩展表头：只在第1行末尾追加缺失的白名单列名
+    - ✅ 对已存在的运单按行号 + 列号精确写入
+    - ✅ 新运单仅写“运单号 + 白名单列”，其他列留空（供人工/验证使用）
+    """
     try:
         ws = client.open(SHEET_WB_SUMMARY).sheet1
     except SpreadsheetNotFound:
-        st.error(f"找不到工作表「{SHEET_WB_SUMMARY}」。请先在 Drive 中创建，并在第一行写入表头（至少包含：运单号）。")
+        st.error(f"找不到工作表「{SHEET_WB_SUMMARY}」。请先创建并在第1行写入表头（至少包含：运单号）。")
         return False
 
-    vals = ws.get_all_values()
-    if not vals:
+    # 读取现有内容（不清表）
+    vals = ws.get_all_values(value_render_option="UNFORMATTED_VALUE", date_time_render_option="SERIAL_NUMBER")
+    if not vals or not vals[0]:
         st.error("『运单全链路汇总』为空且无表头。请先在第一行写好表头（至少包含：运单号）。")
         return False
 
-    header_raw = list(vals[0])
-    if "运单号" not in header_raw:
+    header = list(vals[0])
+    if "运单号" not in header:
         st.error("『运单全链路汇总』缺少“运单号”表头，无法更新。")
         return False
 
-    header_new = header_raw[:]
-    for c in target_cols:
-        if c not in header_new:
-            header_new.append(c)
-
-    exist = pd.DataFrame(vals[1:], columns=header_raw) if len(vals) > 1 else pd.DataFrame(columns=header_raw)
-    for c in header_new:
-        if c not in exist.columns:
-            exist[c] = ""
-
-    exist["运单号"] = exist["运单号"].map(_norm_waybill_str)
+    # 标准化增量数据
     df_delta = df_delta.copy()
+    if "运单号" not in df_delta.columns:
+        st.error("增量数据缺少“运单号”。")
+        return False
     df_delta["运单号"] = df_delta["运单号"].map(_norm_waybill_str)
 
-    exist_idx = exist.set_index("运单号", drop=False)
-    delta_idx = df_delta.set_index("运单号", drop=False)
+    # 1) 只扩展缺失的白名单表头（不移除/不重排既有列）
+    missing_cols = [c for c in MANAGED_COLS if c not in header]
+    if missing_cols:
+        header_new = header + missing_cols
+        ws.update(f"{ws.title}!1:1", [header_new], value_input_option="USER_ENTERED")
+        header = header_new  # 之后都以新表头为准
 
-    common = delta_idx.index.intersection(exist_idx.index)
-    if len(common) > 0:
-        for col in target_cols:
-            if col in header_new and col in delta_idx.columns:
-                exist_idx.loc[common, col] = delta_idx.loc[common, col].values
+    # 2) 构建现有运单的行号索引（第1行为表头，数据从第2行开始）
+    exist_df = pd.DataFrame(vals[1:], columns=header) if len(vals) > 1 else pd.DataFrame(columns=header)
+    if "运单号" not in exist_df.columns:
+        exist_df["运单号"] = ""
+    exist_df["运单号"] = exist_df["运单号"].map(_norm_waybill_str)
+    exist_df["_rowno"] = np.arange(2, 2 + len(exist_df))
 
-    new_keys = list(delta_idx.index.difference(exist_idx.index))
+    idx_exist = exist_df.set_index("运单号", drop=False)
+    idx_delta = df_delta.set_index("运单号", drop=False)
+
+    common = idx_delta.index.intersection(idx_exist.index)          # 已存在运单 → 定点更新
+    new_keys = list(idx_delta.index.difference(idx_exist.index))    # 新运单 → 追加行
+
+    # 3) 对交集做“定点值更新”（只写白名单列，且只写“有效值”）
+    updates = []
+    for col in MANAGED_COLS:
+        if col == "运单号":  # 主键列一般不改，跳过
+            continue
+        if col not in header or col not in idx_delta.columns:
+            continue
+        col_idx = header.index(col) + 1  # A=1
+        # 收集需写入的 (row, [value]) 列表
+        rows = []
+        for wb in common:
+            v = idx_delta.loc[wb, col]
+            if not _is_effective(v):
+                continue  # ⚠️ 空值不写，避免覆盖人工输入
+            rno = int(idx_exist.loc[wb, "_rowno"])
+            rows.append((rno, [_to_jsonable_cell(v)]))
+
+        if not rows:
+            continue
+        # 合并连续行，减少 API 请求
+        rows.sort(key=lambda x: x[0])
+        s = p = None
+        buf = []
+        for r, val in rows:
+            if s is None:
+                s = p = r; buf = [val]
+            elif r == p + 1:
+                p = r; buf.append(val)
+            else:
+                a1_start = rowcol_to_a1(s, col_idx)
+                a1_end   = rowcol_to_a1(p, col_idx)
+                updates.append({"range": f"{ws.title}!{a1_start}:{a1_end}", "values": buf})
+                s = p = r; buf = [val]
+        if s is not None:
+            a1_start = rowcol_to_a1(s, col_idx)
+            a1_end   = rowcol_to_a1(p, col_idx)
+            updates.append({"range": f"{ws.title}!{a1_start}:{a1_end}", "values": buf})
+
+    # 执行批量值更新（不会破坏数据验证/条件格式/其它列）
+    if updates:
+        ws.spreadsheet.values_batch_update(
+            body={"valueInputOption": "USER_ENTERED", "data": updates}
+        )
+
+    # 4) 追加新运单（只写“运单号 + 白名单列”；非白名单一律不写）
     if new_keys:
-        cols_without_wb = [c for c in header_new if c != "运单号"]
-        new_rows = pd.DataFrame(index=new_keys, columns=cols_without_wb).fillna("")
-        new_rows.index.name = "运单号"
-        new_rows = new_rows.reset_index()
-        base_delta = df_delta.set_index("运单号")
-        for col in [c for c in target_cols if c in base_delta.columns]:
-            new_rows.loc[:, col] = base_delta.reindex(new_rows["运单号"])[col].values
-        exist = pd.concat([exist_idx.reset_index(drop=True), new_rows.reindex(columns=header_new)], ignore_index=True)
-    else:
-        exist = exist_idx.reset_index(drop=True)
+        # 仅输出 header 中出现的白名单列（保持列顺序），且包含“运单号”
+        cols_out = [c for c in header if c in MANAGED_COLS]
+        if "运单号" not in cols_out:
+            cols_out = ["运单号"] + cols_out
 
-    ws.clear()
-    ws.append_row(header_new, value_input_option="USER_ENTERED")
-    rows = exist.reindex(columns=header_new).fillna("").values.tolist()
-    if rows:
-        ws.append_rows(rows, value_input_option="USER_ENTERED")
+        base = idx_delta  # 以增量为数据源
+        new_rows = []
+        for wb in new_keys:
+            row_dict = {c: "" for c in cols_out}
+            row_dict["运单号"] = wb
+            for c in cols_out:
+                if c == "运单号": 
+                    continue
+                v = base.loc[wb, c] if (c in base.columns) else ""
+                row_dict[c] = "" if not _is_effective(v) else v
+            # 组装成与整表 header 等长的一行（非白名单列留空，不触碰将来新增的人工列）
+            full_row = [""] * len(header)
+            for c, val in row_dict.items():
+                j = header.index(c)
+                full_row[j] = _to_jsonable_cell(val)
+            new_rows.append(full_row)
+
+        if new_rows:
+            ws.append_rows(new_rows, value_input_option="USER_ENTERED")
+
     return True
 
 # ========= UI：仅启用“按托盘发货” =========
@@ -1555,3 +1649,4 @@ with tab2:
                     st.success(f"已更新 {len(df_target)} 行的『到仓日期』为 {fill_date.strftime('%Y-%m-%d')}。")
                     st.cache_data.clear()
                     st.rerun()
+
