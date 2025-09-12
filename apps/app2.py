@@ -12,9 +12,12 @@
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import SpreadsheetNotFound
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from datetime import datetime, timedelta, date
 import calendar
 import re
@@ -1075,257 +1078,463 @@ st.markdown("""
     }
     </style>
 """, unsafe_allow_html=True)
+tab1, tab2 = st.tabs(["按托盘发货","按卡车回填到仓日期"])
 
-# 刷新
-c1,_ = st.columns([1,6])
-with c1:
-    if st.button("🔄 刷新托盘数据缓存", key="btn_refresh_pallet"):
-        st.cache_data.clear()
-        st.rerun()
+with tab1:
+    # 刷新
+    c1,_ = st.columns([1,6])
+    with c1:
+        if st.button("🔄 刷新托盘数据缓存", key="btn_refresh_pallet"):
+            st.cache_data.clear()
+            st.rerun()
 
-pallet_df = load_pallet_detail_df()
-if pallet_df.empty:
-    st.warning("未从『托盘明细表』读取到数据，请检查表名/权限/表头。")
-    st.stop()
-
-# 排除已发货托盘
-shipped_pallets = load_shipped_pallet_ids()
-if shipped_pallets:
-    pallet_df = pallet_df[~pallet_df["托盘号"].isin(shipped_pallets)]
-
-if pallet_df.empty:
-    st.info("当前可发货的托盘为空（可能都已记录在『发货追踪』）。")
-    st.stop()
-
-# 仓库筛选
-wh_opts = ["（全部）"] + sorted([w for w in pallet_df["仓库代码"].dropna().unique() if str(w).strip()])
-wh_pick = st.selectbox("选择仓库代码（可选）", options=wh_opts, key="wh_pallet")
-if wh_pick != "（全部）":
-    pallet_df = pallet_df[pallet_df["仓库代码"]==wh_pick]
-
-
-# ----------------------- 表格与勾选（防抖版） -----------------------
-show_cols = [
-    "托盘号","仓库代码","托盘重量","长(in)","宽(in)","高(in)","托盘体积",
-    # 新增展示列
-    "托盘创建日期","托盘创建时间",
-    "运单数量","运单清单","运单箱数",
-    "对客承诺送仓时间","送仓时段差值(天)",
-    "ETA/ATA(按运单)","ETD/ATD(按运单)"
-]
-for c in show_cols:
-    if c not in pallet_df.columns:
-        pallet_df[c] = ""
-
-disp_df = pallet_df.copy().reset_index(drop=True)
-for c in ["托盘体积","托盘重量","长(in)","宽(in)","高(in)"]:
-    disp_df[c] = pd.to_numeric(disp_df.get(c, pd.Series()), errors="coerce")
-
-disp_df["托盘体积"] = disp_df["托盘体积"].round(2)
-disp_df["长(in)"] = disp_df["长(in)"].round(2)
-disp_df["宽(in)"] = disp_df["宽(in)"].round(2)
-disp_df["高(in)"] = disp_df["高(in)"].round(2)
-
-# 勾选列置顶
-if "选择" not in disp_df.columns:
-    disp_df["选择"] = False
-cols_order = ["选择"] + show_cols
-
-# 初始化会话态
-if "sel_locked" not in st.session_state:
-    st.session_state.sel_locked = False
-if "locked_df" not in st.session_state:
-    st.session_state.locked_df = pd.DataFrame()
-
-# ========== 选择阶段（不触发全页频繁重算）==========
-if not st.session_state.sel_locked:
-    with st.form("pick_pallets_form", clear_on_submit=False):
-        edited_pal = st.data_editor(
-            disp_df[cols_order],
-            hide_index=True,
-            use_container_width=True,
-            height=500,
-            column_config={"选择": st.column_config.CheckboxColumn("选择")},
-            disabled=[c for c in show_cols],  # 仅“选择”可编辑
-            key="pallet_select_editor"
-        )
-        # 只有提交时才把勾选结果写入 session_state
-        submitted = st.form_submit_button("🔒 锁定选择并进入计算")
-    if submitted:
-        selected_pal = edited_pal[edited_pal["选择"]==True].copy()
-        if len(selected_pal) == 0:
-            st.warning("请至少勾选一个托盘再点击『锁定选择并进入计算』。")
-            st.stop()
-        # 锁定选择 + 保存一次全表快照
-        st.session_state.locked_df = selected_pal.reset_index(drop=True)
-        st.session_state.all_snapshot_df = disp_df[cols_order].copy()
-        st.session_state.sel_locked = True
-        st.rerun()
-
-# ========== 计算阶段（基于已锁定的选择，同时显示未锁定的托盘）==========
-if st.session_state.sel_locked:
-    st.success("✅ 已锁定托盘选择")
-    # 提供“重新选择”
-    if st.button("🔓 重新选择"):
-        st.session_state.sel_locked = False
-        st.session_state.locked_df = pd.DataFrame()
-        st.rerun()
-
-    # 已锁定托盘
-    selected_pal = st.session_state.locked_df.copy()
-    # 其余未锁定托盘（只读展示）
-    locked_ids = set(selected_pal["托盘号"].astype(str))
-    others_df = disp_df[~disp_df["托盘号"].astype(str).isin(locked_ids)].copy()
-    if "选择" in others_df.columns:
-        others_df["选择"] = False
-
-    left, right = st.columns([2, 2], gap="large")
-
-    with left:
-        st.markdown("**📦 已锁定托盘（用于计算）**")
-        st.dataframe(
-            selected_pal[cols_order],
-            use_container_width=True,
-            height=320
-        )
-        st.caption(f"已锁定数量：{len(selected_pal)}")
-
-    with right:
-        st.markdown("**🗂 其他托盘（未锁定，仅查看）**")
-        st.dataframe(
-            others_df[cols_order],
-            use_container_width=True,
-            height=320
-        )
-        st.caption(f"未锁定数量：{len(others_df)}")
-
-    # 选中数量 & 体积合计（只算已锁定）
-    sel_count = int(len(selected_pal))
-    sel_vol_sum = pd.to_numeric(selected_pal.get("托盘体积", pd.Series()), errors="coerce").sum()
-    m1, m2 = st.columns(2)
-    with m1: st.metric("已选择托盘数", sel_count)
-    with m2: st.metric("选中体积合计（CBM）", round(float(sel_vol_sum or 0.0), 2))
-
-    if sel_count == 0:
-        st.info("当前没有锁定的托盘。点击『重新选择』返回。")
+    pallet_df = load_pallet_detail_df()
+    if pallet_df.empty:
+        st.warning("未从『托盘明细表』读取到数据，请检查表名/权限/表头。")
         st.stop()
 
-    # 车次信息（分摊按“托盘重量”）
-    st.subheader("🧾 车次信息（托盘维度分摊）")
-    cc1, cc2 = st.columns([2,2])
-    with cc1:
-        pallet_truck_no = st.text_input("卡车单号（必填）", key="pallet_truck_no")
-    with cc2:
-        pallet_total_cost = st.number_input("本车总费用（必填）", min_value=0.0, step=1.0, format="%.2f", key="pallet_total_cost")
+    # 排除已发货托盘
+    shipped_pallets = load_shipped_pallet_ids()
+    if shipped_pallets:
+        pallet_df = pallet_df[~pallet_df["托盘号"].isin(shipped_pallets)]
 
-    if not pallet_truck_no or pallet_total_cost <= 0:
-        st.info("请填写卡车单号与本车总费用。")
+    if pallet_df.empty:
+        st.info("当前可发货的托盘为空（可能都已记录在『发货追踪』）。")
         st.stop()
 
-    # 分摊计算（按托盘重量）
-    selected_pal["托盘重量"] = pd.to_numeric(selected_pal["托盘重量"], errors="coerce")
-    weights = selected_pal["托盘重量"]
-    if weights.isna().any() or (weights.dropna() <= 0).any():
-        st.error("所选托盘存在缺失或非正的『托盘重量』，无法分摊。请先在『托盘明细表』修正。")
-        st.stop()
+    # 仓库筛选
+    wh_opts = ["（全部）"] + sorted([w for w in pallet_df["仓库代码"].dropna().unique() if str(w).strip()])
+    wh_pick = st.selectbox("选择仓库代码（可选）", options=wh_opts, key="wh_pallet")
+    if wh_pick != "（全部）":
+        pallet_df = pallet_df[pallet_df["仓库代码"]==wh_pick]
 
-    wt_sum = float(weights.sum())
-    if wt_sum <= 0:
-        st.error("总托盘重量为 0，无法分摊。")
-        st.stop()
 
-    selected_pal["分摊比例"] = weights / wt_sum
-    selected_pal["分摊费用_raw"] = selected_pal["分摊比例"] * float(pallet_total_cost)
-    selected_pal["分摊费用"] = selected_pal["分摊费用_raw"].round(2)
-    diff_cost = round(float(pallet_total_cost) - selected_pal["分摊费用"].sum(), 2)
-    if abs(diff_cost) >= 0.01:
-        selected_pal.loc[selected_pal.index[-1], "分摊费用"] += diff_cost
-
-    upload_df = selected_pal.copy()
-    upload_df["卡车单号"] = pallet_truck_no
-    upload_df["总费用"] = round(float(pallet_total_cost), 2)
-    upload_df["分摊比例"] = (upload_df["分摊比例"]*100).round(2).astype(str) + "%"
-    upload_df["分摊费用"] = upload_df["分摊费用"].map(lambda x: f"{x:.2f}")
-    upload_df["总费用"] = upload_df["总费用"].map(lambda x: f"{x:.2f}")
-    upload_df["托盘体积"] = pd.to_numeric(upload_df.get("托盘体积", pd.Series()), errors="coerce").round(2)
-
-    preview_cols_pal = [
-        "卡车单号","仓库代码","托盘号","托盘重量","长(in)","宽(in)","高(in)","托盘体积",
-        # 同步在预览也看得到创建时间（只读展示，不写发货追踪）
+    # ----------------------- 表格与勾选（防抖版） -----------------------
+    show_cols = [
+        "托盘号","仓库代码","托盘重量","长(in)","宽(in)","高(in)","托盘体积",
+        # 新增展示列
         "托盘创建日期","托盘创建时间",
-        "运单数量","运单清单",
+        "运单数量","运单清单","运单箱数",
         "对客承诺送仓时间","送仓时段差值(天)",
-        "ETA/ATA(按运单)","ETD/ATD(按运单)",
-        "分摊比例","分摊费用","总费用"
+        "ETA/ATA(按运单)","ETD/ATD(按运单)"
     ]
-    for c in preview_cols_pal:
-        if c not in upload_df.columns:
-            upload_df[c] = ""
+    for c in show_cols:
+        if c not in pallet_df.columns:
+            pallet_df[c] = ""
 
-    st.subheader("✅ 上传预览（托盘 → 发货追踪）")
-    st.dataframe(upload_df[preview_cols_pal], use_container_width=True, height=360)
+    disp_df = pallet_df.copy().reset_index(drop=True)
+    for c in ["托盘体积","托盘重量","长(in)","宽(in)","高(in)"]:
+        disp_df[c] = pd.to_numeric(disp_df.get(c, pd.Series()), errors="coerce")
 
-    st.markdown("""
-    **分摊比例计算公式：** 每个托盘的分摊比例 = 该托盘重量 ÷ 所有选中托盘重量总和  
-    **分摊费用计算公式：** 每个托盘的分摊费用 = 分摊比例 × 本车总费用  
-    （最后一托盘自动调整几分钱差额，确保总额=本车总费用）
-    """)
+    disp_df["托盘体积"] = disp_df["托盘体积"].round(2)
+    disp_df["长(in)"] = disp_df["长(in)"].round(2)
+    disp_df["宽(in)"] = disp_df["宽(in)"].round(2)
+    disp_df["高(in)"] = disp_df["高(in)"].round(2)
 
-    # 上传按钮
-    if st.button("📤 追加上传到『发货追踪』", key="btn_upload_pallet"):
-        try:
-            ss = client.open(SHEET_SHIP_TRACKING); ws_track = ss.sheet1
-        except SpreadsheetNotFound:
-            st.error(f"找不到工作表「{SHEET_SHIP_TRACKING}」。请先在 Google Drive 中创建，并设置第一行表头。")
-            st.stop()
+    # 勾选列置顶
+    if "选择" not in disp_df.columns:
+        disp_df["选择"] = False
+    cols_order = ["选择"] + show_cols
 
-        exist = ws_track.get_all_values()
-        if not exist:
-            st.error("目标表为空且无表头。请先在第一行写好表头（标题行）。")
-            st.stop()
-
-        header_raw = exist[0]
-        header_norm = _norm_header(header_raw)
-        header_norm_lower = [h.lower() for h in header_norm]
-        need_ok = any(n in header_norm for n in ["托盘号","托盘编号"]) or \
-                  any(n in header_norm_lower for n in ["palletid","palletno","pallet编号"])
-        if not need_ok:
-            st.error("『发货追踪』缺少“托盘号”列（或等价列如 PalletID/PalletNo）。请先在目标表增加该列。")
-            st.stop()
-
-        tmp = upload_df.copy()
-        if ("日期" in header_raw) and ("日期" not in tmp.columns):
-            tmp["日期"] = datetime.today().strftime("%Y-%m-%d")
-
-        for col in header_raw:
-            if col not in tmp.columns:
-                tmp[col] = ""
-        rows = tmp.reindex(columns=header_raw).fillna("").values.tolist()
-        ws_track.append_rows(rows, value_input_option="USER_ENTERED")
-
-        st.success(f"已上传 {len(rows)} 条到『{SHEET_SHIP_TRACKING}』。卡车单号：{pallet_truck_no}")
-
-        # 更新『运单全链路汇总』
-        try:
-            st.info("正在更新『运单全链路汇总』（只含『发货追踪』里的运单；仅更新指定列）…")
-            df_delta = build_waybill_delta()
-            if df_delta.empty:
-                st.warning("没有可更新的数据（检查到仓/发货/自提表）。")
-            else:
-                ok = upsert_waybill_summary_partial(df_delta)
-                if ok:
-                    st.success(f"已更新/新增 {len(df_delta)} 条到『{SHEET_WB_SUMMARY}』。")
-                else:
-                    st.warning("未能写入『运单全链路汇总』：请先创建该表并确保首行包含“运单号”列。")
-        except Exception as e:
-            st.warning(f"更新『运单全链路汇总』失败：{e}")
-
-        # 上传成功后清缓存/解锁
-        st.cache_data.clear()
+    # 初始化会话态
+    if "sel_locked" not in st.session_state:
         st.session_state.sel_locked = False
+    if "locked_df" not in st.session_state:
         st.session_state.locked_df = pd.DataFrame()
-        st.session_state.pop("pallet_select_editor", None)
-        st.rerun()
-# ----------------------- 选择与计算片段结束 -----------------------
+
+    # ========== 选择阶段（不触发全页频繁重算）==========
+    if not st.session_state.sel_locked:
+        with st.form("pick_pallets_form", clear_on_submit=False):
+            edited_pal = st.data_editor(
+                disp_df[cols_order],
+                hide_index=True,
+                use_container_width=True,
+                height=500,
+                column_config={"选择": st.column_config.CheckboxColumn("选择")},
+                disabled=[c for c in show_cols],  # 仅“选择”可编辑
+                key="pallet_select_editor"
+            )
+            # 只有提交时才把勾选结果写入 session_state
+            submitted = st.form_submit_button("🔒 锁定选择并进入计算")
+        if submitted:
+            selected_pal = edited_pal[edited_pal["选择"]==True].copy()
+            if len(selected_pal) == 0:
+                st.warning("请至少勾选一个托盘再点击『锁定选择并进入计算』。")
+                st.stop()
+            # 锁定选择 + 保存一次全表快照
+            st.session_state.locked_df = selected_pal.reset_index(drop=True)
+            st.session_state.all_snapshot_df = disp_df[cols_order].copy()
+            st.session_state.sel_locked = True
+            st.rerun()
+
+    # ========== 计算阶段（基于已锁定的选择，同时显示未锁定的托盘）==========
+    if st.session_state.sel_locked:
+        st.success("✅ 已锁定托盘选择")
+        # 提供“重新选择”
+        if st.button("🔓 重新选择"):
+            st.session_state.sel_locked = False
+            st.session_state.locked_df = pd.DataFrame()
+            st.rerun()
+
+        # 已锁定托盘
+        selected_pal = st.session_state.locked_df.copy()
+        # 其余未锁定托盘（只读展示）
+        locked_ids = set(selected_pal["托盘号"].astype(str))
+        others_df = disp_df[~disp_df["托盘号"].astype(str).isin(locked_ids)].copy()
+        if "选择" in others_df.columns:
+            others_df["选择"] = False
+
+        left, right = st.columns([2, 2], gap="large")
+
+        with left:
+            st.markdown("**📦 已锁定托盘（用于计算）**")
+            st.dataframe(
+                selected_pal[cols_order],
+                use_container_width=True,
+                height=320
+            )
+            st.caption(f"已锁定数量：{len(selected_pal)}")
+
+        with right:
+            st.markdown("**🗂 其他托盘（未锁定，仅查看）**")
+            st.dataframe(
+                others_df[cols_order],
+                use_container_width=True,
+                height=320
+            )
+            st.caption(f"未锁定数量：{len(others_df)}")
+
+        # 选中数量 & 体积合计（只算已锁定）
+        sel_count = int(len(selected_pal))
+        sel_vol_sum = pd.to_numeric(selected_pal.get("托盘体积", pd.Series()), errors="coerce").sum()
+        m1, m2 = st.columns(2)
+        with m1: st.metric("已选择托盘数", sel_count)
+        with m2: st.metric("选中体积合计（CBM）", round(float(sel_vol_sum or 0.0), 2))
+
+        if sel_count == 0:
+            st.info("当前没有锁定的托盘。点击『重新选择』返回。")
+            st.stop()
+
+        # 车次信息（分摊按“托盘重量”）
+        st.subheader("🧾 车次信息（托盘维度分摊）")
+        cc1, cc2 = st.columns([2,2])
+        with cc1:
+            pallet_truck_no = st.text_input("卡车单号（必填）", key="pallet_truck_no")
+        with cc2:
+            pallet_total_cost = st.number_input("本车总费用（必填）", min_value=0.0, step=1.0, format="%.2f", key="pallet_total_cost")
+
+        if not pallet_truck_no or pallet_total_cost <= 0:
+            st.info("请填写卡车单号与本车总费用。")
+            st.stop()
+
+        # 分摊计算（按托盘重量）
+        selected_pal["托盘重量"] = pd.to_numeric(selected_pal["托盘重量"], errors="coerce")
+        weights = selected_pal["托盘重量"]
+        if weights.isna().any() or (weights.dropna() <= 0).any():
+            st.error("所选托盘存在缺失或非正的『托盘重量』，无法分摊。请先在『托盘明细表』修正。")
+            st.stop()
+
+        wt_sum = float(weights.sum())
+        if wt_sum <= 0:
+            st.error("总托盘重量为 0，无法分摊。")
+            st.stop()
+
+        selected_pal["分摊比例"] = weights / wt_sum
+        selected_pal["分摊费用_raw"] = selected_pal["分摊比例"] * float(pallet_total_cost)
+        selected_pal["分摊费用"] = selected_pal["分摊费用_raw"].round(2)
+        diff_cost = round(float(pallet_total_cost) - selected_pal["分摊费用"].sum(), 2)
+        if abs(diff_cost) >= 0.01:
+            selected_pal.loc[selected_pal.index[-1], "分摊费用"] += diff_cost
+
+        upload_df = selected_pal.copy()
+        upload_df["卡车单号"] = pallet_truck_no
+        upload_df["总费用"] = round(float(pallet_total_cost), 2)
+        upload_df["分摊比例"] = (upload_df["分摊比例"]*100).round(2).astype(str) + "%"
+        upload_df["分摊费用"] = upload_df["分摊费用"].map(lambda x: f"{x:.2f}")
+        upload_df["总费用"] = upload_df["总费用"].map(lambda x: f"{x:.2f}")
+        upload_df["托盘体积"] = pd.to_numeric(upload_df.get("托盘体积", pd.Series()), errors="coerce").round(2)
+
+        preview_cols_pal = [
+            "卡车单号","仓库代码","托盘号","托盘重量","长(in)","宽(in)","高(in)","托盘体积",
+            # 同步在预览也看得到创建时间（只读展示，不写发货追踪）
+            "托盘创建日期","托盘创建时间",
+            "运单数量","运单清单",
+            "对客承诺送仓时间","送仓时段差值(天)",
+            "ETA/ATA(按运单)","ETD/ATD(按运单)",
+            "分摊比例","分摊费用","总费用"
+        ]
+        for c in preview_cols_pal:
+            if c not in upload_df.columns:
+                upload_df[c] = ""
+
+        st.subheader("✅ 上传预览（托盘 → 发货追踪）")
+        st.dataframe(upload_df[preview_cols_pal], use_container_width=True, height=360)
+
+        st.markdown("""
+        **分摊比例计算公式：** 每个托盘的分摊比例 = 该托盘重量 ÷ 所有选中托盘重量总和  
+        **分摊费用计算公式：** 每个托盘的分摊费用 = 分摊比例 × 本车总费用  
+        （最后一托盘自动调整几分钱差额，确保总额=本车总费用）
+        """)
+
+        # 上传按钮
+        if st.button("📤 追加上传到『发货追踪』", key="btn_upload_pallet"):
+            try:
+                ss = client.open(SHEET_SHIP_TRACKING); ws_track = ss.sheet1
+            except SpreadsheetNotFound:
+                st.error(f"找不到工作表「{SHEET_SHIP_TRACKING}」。请先在 Google Drive 中创建，并设置第一行表头。")
+                st.stop()
+
+            exist = ws_track.get_all_values()
+            if not exist:
+                st.error("目标表为空且无表头。请先在第一行写好表头（标题行）。")
+                st.stop()
+
+            header_raw = exist[0]
+            header_norm = _norm_header(header_raw)
+            header_norm_lower = [h.lower() for h in header_norm]
+            need_ok = any(n in header_norm for n in ["托盘号","托盘编号"]) or \
+                    any(n in header_norm_lower for n in ["palletid","palletno","pallet编号"])
+            if not need_ok:
+                st.error("『发货追踪』缺少“托盘号”列（或等价列如 PalletID/PalletNo）。请先在目标表增加该列。")
+                st.stop()
+
+            tmp = upload_df.copy()
+            if ("日期" in header_raw) and ("日期" not in tmp.columns):
+                tmp["日期"] = datetime.today().strftime("%Y-%m-%d")
+
+            for col in header_raw:
+                if col not in tmp.columns:
+                    tmp[col] = ""
+            rows = tmp.reindex(columns=header_raw).fillna("").values.tolist()
+            ws_track.append_rows(rows, value_input_option="USER_ENTERED")
+
+            st.success(f"已上传 {len(rows)} 条到『{SHEET_SHIP_TRACKING}』。卡车单号：{pallet_truck_no}")
+
+            # 更新『运单全链路汇总』
+            try:
+                st.info("正在更新『运单全链路汇总』（只含『发货追踪』里的运单；仅更新指定列）…")
+                df_delta = build_waybill_delta()
+                if df_delta.empty:
+                    st.warning("没有可更新的数据（检查到仓/发货/自提表）。")
+                else:
+                    ok = upsert_waybill_summary_partial(df_delta)
+                    if ok:
+                        st.success(f"已更新/新增 {len(df_delta)} 条到『{SHEET_WB_SUMMARY}』。")
+                    else:
+                        st.warning("未能写入『运单全链路汇总』：请先创建该表并确保首行包含“运单号”列。")
+            except Exception as e:
+                st.warning(f"更新『运单全链路汇总』失败：{e}")
+
+            # 上传成功后清缓存/解锁
+            st.cache_data.clear()
+            st.session_state.sel_locked = False
+            st.session_state.locked_df = pd.DataFrame()
+            st.session_state.pop("pallet_select_editor", None)
+            st.rerun()
+    # ----------------------- 选择与计算片段结束 -----------------------
+
+with tab2:
+
+    st.subheader("🚚 按卡车回填到仓日期（批量）")
+
+    # 读取《运单全链路汇总》
+    @st.cache_data(ttl=60)
+    def load_waybill_summary_df():
+        try:
+            ws = client.open(SHEET_WB_SUMMARY).sheet1
+        except SpreadsheetNotFound:
+            st.error(f"找不到工作表「{SHEET_WB_SUMMARY}」。")
+            return pd.DataFrame(), None, []
+        vals = ws.get_all_values(
+            value_render_option="UNFORMATTED_VALUE",
+            date_time_render_option="SERIAL_NUMBER"
+        )
+        if not vals:
+            st.warning("『运单全链路汇总』为空。")
+            return pd.DataFrame(), ws, []
+
+        header_raw = vals[0]
+        df = pd.DataFrame(vals[1:], columns=header_raw) if len(vals) > 1 else pd.DataFrame(columns=header_raw)
+
+        # 找关键列：运单号/仓库代码/发走卡车号/发走日期/到仓日期（名称允许不完全一致）
+        def pick(colnames, cands):
+            for c in cands:
+                if c in colnames:
+                    return c
+            return None
+
+        col_wb   = pick(df.columns, ["运单号","Waybill"])
+        col_wh   = pick(df.columns, ["仓库代码","仓库"])
+        col_trk  = pick(df.columns, ["发走卡车号","发走车号","发走卡车","卡车号","TruckNo","Truck"])
+        col_ship = pick(df.columns, ["发走日期","发货日期","出仓日期"])
+        col_eta  = pick(df.columns, ["到仓日期","到仓日","到仓(wh)"])
+
+        # 兜底：缺失的列先补空（只在内存中补，不改表）
+        if col_wb   is None: df["运单号"]   = ""; col_wb   = "运单号"
+        if col_wh   is None: df["仓库代码"] = ""; col_wh   = "仓库代码"
+        if col_trk  is None: df["发走卡车号"] = ""; col_trk  = "发走卡车号"
+        if col_ship is None: df["发走日期"]  = ""; col_ship = "发走日期"
+        if col_eta  is None: df["到仓日期"]  = ""; col_eta  = "到仓日期"
+
+        # 统一命名（仅用于本地 DataFrame，不影响表头）
+        df_work = df.rename(columns={
+            col_wb: "运单号",
+            col_wh: "仓库代码",
+            col_trk: "发走卡车号",
+            col_ship: "发走日期",
+            col_eta: "到仓日期",
+        }).copy()
+
+        # 解析为 date；保留实际行号（写回用）
+        df_work["_rowno"] = np.arange(2, 2 + len(df_work))  # Google 表格行号（表头是第1行）
+        df_work["_发走日期_dt"] = df_work["发走日期"].apply(_parse_sheet_value_to_date)   # -> date 或 None
+        df_work["_到仓日期_dt"] = df_work["到仓日期"].apply(_parse_sheet_value_to_date)   # -> date 或 None
+
+        return df_work, ws, header_raw
+
+    df_sum, ws_sum, header_raw = load_waybill_summary_df()
+    if ws_sum is None or df_sum.empty:
+        st.stop()
+
+    # 侧边过滤：卡车号 / 仓库 / 发走日期范围 / 仅填空白
+    c1, c2 = st.columns([2,1])
+    with c1:
+        truck_opts_all = sorted(set([str(t).strip() for t in df_sum["发走卡车号"].astype(str) if str(t).strip()]))
+        has_truck = len(truck_opts_all) > 0
+        truck_no = st.selectbox(
+            "选择发走卡车号",
+            options=(truck_opts_all if has_truck else ["（无数据）"]),
+            index=0
+        )
+    with c2:
+        only_blank = st.checkbox("仅填空白到仓日期", value=True)
+
+    if not has_truck:
+        st.info("没有可用的发走卡车号。")
+        st.stop()
+
+    wh_all = sorted([w for w in df_sum["仓库代码"].astype(str).unique() if w.strip()])
+    wh_pick = st.multiselect("按仓库代码筛选（可多选，留空=全部）", options=wh_all)
+
+    # 发走日期范围（全部统一用 date 类型）
+    valid_ship_dates = df_sum.loc[df_sum["_发走日期_dt"].notna(), "_发走日期_dt"]
+    if not valid_ship_dates.empty:
+        dmin, dmax = valid_ship_dates.min(), valid_ship_dates.max()
+        r1, r2 = st.date_input(
+            "按发走日期筛选范围",
+            value=(dmin, dmax),
+            min_value=dmin, max_value=dmax
+        )
+    else:
+        r1 = r2 = None
+
+    # 组合筛选（全部用 date 比较）
+    filt = (df_sum["发走卡车号"].astype(str) == str(truck_no))
+    if wh_pick:
+        filt &= df_sum["仓库代码"].isin(wh_pick)
+    if r1 and r2:
+        filt &= df_sum["_发走日期_dt"].between(r1, r2)
+    if only_blank:
+        filt &= df_sum["_到仓日期_dt"].isna()
+
+    df_target = df_sum.loc[filt].copy()
+
+    st.markdown(f"**匹配到 {len(df_target)} 条运单**")
+    st.dataframe(
+    df_target[["运单号","仓库代码","发走卡车号","到仓日期"]]
+        .sort_values(["仓库代码","运单号"]),
+        use_container_width=True, height=320
+    )
 
 
+    st.divider()
+    # 要写入的“到仓日期”
+    today = date.today()
+    fill_date = st.date_input("填充到仓日期（批量）", value=today)
+
+
+    def _get_google_credentials():
+        if "gcp_service_account" in st.secrets:
+            sa_info = st.secrets["gcp_service_account"]
+            return Credentials.from_service_account_info(sa_info, scopes=SCOPES)
+        else:
+            return Credentials.from_service_account_file("service_accounts.json", scopes=SCOPES)
+
+    def _write_arrival_date(rows_idx, date_to_fill: date):
+        # 1) 找到“到仓日期”列（A1 列号从 1 开始）
+        col_idx_1based = None
+        for i, h in enumerate(header_raw):
+            if h.replace(" ", "") in ["到仓日期", "到仓日", "到仓(wh)"]:
+                col_idx_1based = i + 1
+                break
+        if col_idx_1based is None:
+            st.error("目标表缺少『到仓日期』列。请先在表头新增该列后重试。")
+            return False
+        if not rows_idx:
+            return True
+
+        # 2) 合并连续行，减少请求次数
+        rows = sorted(int(r) for r in rows_idx)
+        ranges = []
+        s = p = rows[0]
+        for r in rows[1:]:
+            if r == p + 1:
+                p = r
+            else:
+                ranges.append((s, p))
+                s = p = r
+        ranges.append((s, p))
+
+        # 3) 用 googleapiclient 直接调用 Sheets API 批量写入
+        try:
+            creds = _get_google_credentials()
+            service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+            spreadsheet_id = ws_sum.spreadsheet.id  # 直接用 gspread 的表ID
+            sheet_title = ws_sum.title              # 工作表名称
+
+            date_str = date_to_fill.strftime("%Y-%m-%d")
+
+            # 分批（一次最多组装 200 个 range，避免超大 payload）
+            batch_size = 200
+            for i in range(0, len(ranges), batch_size):
+                sub = ranges[i:i + batch_size]
+                data = []
+                for r1, r2 in sub:
+                    a1_start = gspread.utils.rowcol_to_a1(r1, col_idx_1based)
+                    a1_end   = gspread.utils.rowcol_to_a1(r2, col_idx_1based)
+                    a1_range = f"{sheet_title}!{a1_start}:{a1_end}"
+                    values = [[date_str] for _ in range(r2 - r1 + 1)]
+                    data.append({"range": a1_range, "values": values})
+
+                body = {
+                    "valueInputOption": "USER_ENTERED",
+                    "data": data
+                }
+                service.spreadsheets().values().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body=body
+                ).execute()
+
+            return True
+        except HttpError as e:
+            st.error(f"写入失败（HTTP）：{e}")
+            return False
+        except Exception as e:
+            st.error(f"写入失败：{e}")
+            return False
+
+
+
+    left, right = st.columns([1,1])
+    with left:
+        st.caption("提示：勾选“仅填空白”可避免覆盖已有到仓日期。")
+    with right:
+        if st.button("📝 批量写入到仓日期", key="btn_fill_arrival_date"):
+            if df_target.empty:
+                st.warning("筛选结果为空；请调整筛选条件。")
+            else:
+                ok = _write_arrival_date(df_target["_rowno"].tolist(), fill_date)
+                if ok:
+                    st.success(f"已更新 {len(df_target)} 行的『到仓日期』为 {fill_date.strftime('%Y-%m-%d')}。")
+                    st.cache_data.clear()
+                    st.rerun()
