@@ -1559,7 +1559,7 @@ with tab2:
 
     st.markdown(f"**匹配到 {len(df_target)} 条运单**")
     st.dataframe(
-        df_target[["运单号","仓库代码","发走卡车号","发走日期","到仓日期"]]
+        df_target[["运单号","仓库代码","发走卡车号","到仓日期"]]
             .sort_values(["仓库代码","发走卡车号","运单号"]),
         use_container_width=True, height=360
     )
