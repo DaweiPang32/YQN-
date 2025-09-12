@@ -1335,9 +1335,9 @@ with tab1:
 
 with tab2:
 
-    st.subheader("🚚 按卡车回填到仓日期（批量）")
+    st.subheader("🚚 按卡车回填到仓日期（先选仓库 → 再选卡车）")
 
-    # 读取《运单全链路汇总》
+    # ====== 读取《运单全链路汇总》 ======
     @st.cache_data(ttl=60)
     def load_waybill_summary_df():
         try:
@@ -1356,7 +1356,7 @@ with tab2:
         header_raw = vals[0]
         df = pd.DataFrame(vals[1:], columns=header_raw) if len(vals) > 1 else pd.DataFrame(columns=header_raw)
 
-        # 找关键列：运单号/仓库代码/发走卡车号/发走日期/到仓日期（名称允许不完全一致）
+        # 关键列映射（允许轻微差异）
         def pick(colnames, cands):
             for c in cands:
                 if c in colnames:
@@ -1369,14 +1369,14 @@ with tab2:
         col_ship = pick(df.columns, ["发走日期","发货日期","出仓日期"])
         col_eta  = pick(df.columns, ["到仓日期","到仓日","到仓(wh)"])
 
-        # 兜底：缺失的列先补空（只在内存中补，不改表）
+        # 缺失的列在内存中补空（不改表结构）
         if col_wb   is None: df["运单号"]   = ""; col_wb   = "运单号"
         if col_wh   is None: df["仓库代码"] = ""; col_wh   = "仓库代码"
         if col_trk  is None: df["发走卡车号"] = ""; col_trk  = "发走卡车号"
         if col_ship is None: df["发走日期"]  = ""; col_ship = "发走日期"
         if col_eta  is None: df["到仓日期"]  = ""; col_eta  = "到仓日期"
 
-        # 统一命名（仅用于本地 DataFrame，不影响表头）
+        # 统一列名（仅 DataFrame 内部）
         df_work = df.rename(columns={
             col_wb: "运单号",
             col_wh: "仓库代码",
@@ -1385,10 +1385,16 @@ with tab2:
             col_eta: "到仓日期",
         }).copy()
 
-        # 解析为 date；保留实际行号（写回用）
-        df_work["_rowno"] = np.arange(2, 2 + len(df_work))  # Google 表格行号（表头是第1行）
-        df_work["_发走日期_dt"] = df_work["发走日期"].apply(_parse_sheet_value_to_date)   # -> date 或 None
-        df_work["_到仓日期_dt"] = df_work["到仓日期"].apply(_parse_sheet_value_to_date)   # -> date 或 None
+        # 行号用于回写（Google 表：表头是第1行）
+        df_work["_rowno"] = np.arange(2, 2 + len(df_work))
+
+        # 解析日期为 date
+        df_work["_发走日期_dt"] = df_work["发走日期"].apply(_parse_sheet_value_to_date)
+        df_work["_到仓日期_dt"] = df_work["到仓日期"].apply(_parse_sheet_value_to_date)
+
+        # 规范：字符串清理
+        df_work["仓库代码"] = df_work["仓库代码"].astype(str).str.strip()
+        df_work["发走卡车号"] = df_work["发走卡车号"].astype(str).str.strip()
 
         return df_work, ws, header_raw
 
@@ -1396,42 +1402,60 @@ with tab2:
     if ws_sum is None or df_sum.empty:
         st.stop()
 
-    # 侧边过滤：卡车号 / 仓库 / 发走日期范围 / 仅填空白
-    c1, c2 = st.columns([2,1])
-    with c1:
-        truck_opts_all = sorted(set([str(t).strip() for t in df_sum["发走卡车号"].astype(str) if str(t).strip()]))
-        has_truck = len(truck_opts_all) > 0
-        truck_no = st.selectbox(
-            "选择发走卡车号",
-            options=(truck_opts_all if has_truck else ["（无数据）"]),
-            index=0
-        )
-    with c2:
-        only_blank = st.checkbox("仅填空白到仓日期", value=True)
+    # ===================== 筛选（先仓库 → 再卡车） =====================
+    st.subheader("筛选条件")
 
-    if not has_truck:
-        st.info("没有可用的发走卡车号。")
-        st.stop()
-
+    # 1) 选择仓库（多选；留空=全部）
     wh_all = sorted([w for w in df_sum["仓库代码"].astype(str).unique() if w.strip()])
-    wh_pick = st.multiselect("按仓库代码筛选（可多选，留空=全部）", options=wh_all)
+    wh_pick = st.multiselect("仓库代码（先选这里）", options=wh_all, placeholder="选择一个或多个仓库…")
 
-    # 发走日期范围（全部统一用 date 类型）
-    valid_ship_dates = df_sum.loc[df_sum["_发走日期_dt"].notna(), "_发走日期_dt"]
+    # 基于仓库筛选后的子集
+    if wh_pick:
+        df_wh = df_sum[df_sum["仓库代码"].isin(wh_pick)].copy()
+    else:
+        df_wh = df_sum.copy()
+
+    # 2) 由仓库集合动态派生“发走卡车号”选项
+    truck_opts = sorted([t for t in df_wh["发走卡车号"].astype(str).unique() if t.strip()])
+    if truck_opts:
+        trucks_pick = st.multiselect(
+            "卡车单号（从所选仓库派生）",
+            options=truck_opts,
+            placeholder="选择要批量回填的车次…"
+        )
+    else:
+        st.info("当前仓库下没有可选的卡车单号。")
+        trucks_pick = []
+
+    # 3) 发走日期范围（基于“仓库+卡车”集合）
+    df_for_dates = df_wh.copy()
+    if trucks_pick:
+        df_for_dates = df_for_dates[df_for_dates["发走卡车号"].astype(str).isin(trucks_pick)]
+
+    valid_ship_dates = df_for_dates.loc[df_for_dates["_发走日期_dt"].notna(), "_发走日期_dt"]
     if not valid_ship_dates.empty:
         dmin, dmax = valid_ship_dates.min(), valid_ship_dates.max()
+        # 避免相同日期导致 date_input 报错
+        default_start = dmin
+        default_end = dmax if dmax >= dmin else dmin
         r1, r2 = st.date_input(
             "按发走日期筛选范围",
-            value=(dmin, dmax),
-            min_value=dmin, max_value=dmax
+            value=(default_start, default_end),
+            min_value=dmin, max_value=max(dmax, dmin)
         )
     else:
         r1 = r2 = None
+        st.caption("未检索到可用的『发走日期』范围（所选条件可能没有日期数据）。")
 
-    # 组合筛选（全部用 date 比较）
-    filt = (df_sum["发走卡车号"].astype(str) == str(truck_no))
+    # 4) 仅填空白到仓日期
+    only_blank = st.checkbox("仅填空白到仓日期", value=True)
+
+    # 5) 组合筛选：仓库 → 卡车 → 日期 → 仅空白
+    filt = pd.Series(True, index=df_sum.index)
     if wh_pick:
         filt &= df_sum["仓库代码"].isin(wh_pick)
+    if trucks_pick:
+        filt &= df_sum["发走卡车号"].astype(str).isin(trucks_pick)
     if r1 and r2:
         filt &= df_sum["_发走日期_dt"].between(r1, r2)
     if only_blank:
@@ -1441,17 +1465,16 @@ with tab2:
 
     st.markdown(f"**匹配到 {len(df_target)} 条运单**")
     st.dataframe(
-    df_target[["运单号","仓库代码","发走卡车号","到仓日期"]]
-        .sort_values(["仓库代码","运单号"]),
-        use_container_width=True, height=320
+        df_target[["运单号","仓库代码","发走卡车号","发走日期","到仓日期"]]
+            .sort_values(["仓库代码","发走卡车号","运单号"]),
+        use_container_width=True, height=360
     )
 
-
     st.divider()
-    # 要写入的“到仓日期”
+
+    # ====== 写入到仓日期 ======
     today = date.today()
     fill_date = st.date_input("填充到仓日期（批量）", value=today)
-
 
     def _get_google_credentials():
         if "gcp_service_account" in st.secrets:
@@ -1461,7 +1484,7 @@ with tab2:
             return Credentials.from_service_account_file("service_accounts.json", scopes=SCOPES)
 
     def _write_arrival_date(rows_idx, date_to_fill: date):
-        # 1) 找到“到仓日期”列（A1 列号从 1 开始）
+        # 1) 找到“到仓日期”列 A1 列号（从 1 开始）
         col_idx_1based = None
         for i, h in enumerate(header_raw):
             if h.replace(" ", "") in ["到仓日期", "到仓日", "到仓(wh)"]:
@@ -1473,7 +1496,7 @@ with tab2:
         if not rows_idx:
             return True
 
-        # 2) 合并连续行，减少请求次数
+        # 2) 合并连续行，减少 API 请求
         rows = sorted(int(r) for r in rows_idx)
         ranges = []
         s = p = rows[0]
@@ -1485,31 +1508,27 @@ with tab2:
                 s = p = r
         ranges.append((s, p))
 
-        # 3) 用 googleapiclient 直接调用 Sheets API 批量写入
+        # 3) 用 googleapiclient 批量写入
         try:
             creds = _get_google_credentials()
             service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-            spreadsheet_id = ws_sum.spreadsheet.id  # 直接用 gspread 的表ID
-            sheet_title = ws_sum.title              # 工作表名称
+            spreadsheet_id = ws_sum.spreadsheet.id
+            sheet_title = ws_sum.title
 
             date_str = date_to_fill.strftime("%Y-%m-%d")
 
-            # 分批（一次最多组装 200 个 range，避免超大 payload）
             batch_size = 200
             for i in range(0, len(ranges), batch_size):
                 sub = ranges[i:i + batch_size]
                 data = []
-                for r1, r2 in sub:
-                    a1_start = gspread.utils.rowcol_to_a1(r1, col_idx_1based)
-                    a1_end   = gspread.utils.rowcol_to_a1(r2, col_idx_1based)
+                for r1_, r2_ in sub:
+                    a1_start = gspread.utils.rowcol_to_a1(r1_, col_idx_1based)
+                    a1_end   = gspread.utils.rowcol_to_a1(r2_, col_idx_1based)
                     a1_range = f"{sheet_title}!{a1_start}:{a1_end}"
-                    values = [[date_str] for _ in range(r2 - r1 + 1)]
+                    values = [[date_str] for _ in range(r2_ - r1_ + 1)]
                     data.append({"range": a1_range, "values": values})
 
-                body = {
-                    "valueInputOption": "USER_ENTERED",
-                    "data": data
-                }
+                body = {"valueInputOption": "USER_ENTERED", "data": data}
                 service.spreadsheets().values().batchUpdate(
                     spreadsheetId=spreadsheet_id,
                     body=body
@@ -1523,15 +1542,13 @@ with tab2:
             st.error(f"写入失败：{e}")
             return False
 
-
-
     left, right = st.columns([1,1])
     with left:
-        st.caption("提示：勾选“仅填空白”可避免覆盖已有到仓日期。")
+        st.caption("提示：先选仓库，再选卡车；可按发走日期范围过滤；勾选“仅填空白”避免覆盖已有值。")
     with right:
         if st.button("📝 批量写入到仓日期", key="btn_fill_arrival_date"):
             if df_target.empty:
-                st.warning("筛选结果为空；请调整筛选条件。")
+                st.warning("筛选结果为空；请调整仓库/卡车/日期条件。")
             else:
                 ok = _write_arrival_date(df_target["_rowno"].tolist(), fill_date)
                 if ok:
