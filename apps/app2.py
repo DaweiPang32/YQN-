@@ -1109,13 +1109,13 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
             elif r == p + 1:
                 p = r; buf.append(val)
             else:
-                a1_start = rowcol_to_a1(s, col_idx)
-                a1_end   = rowcol_to_a1(p, col_idx)
+                a1_start = gspread.utils.rowcol_to_a1(s, col_idx)
+                a1_end   = gspread.utils.rowcol_to_a1(p, col_idx)
                 updates.append({"range": f"{ws.title}!{a1_start}:{a1_end}", "values": buf})
                 s = p = r; buf = [val]
         if s is not None:
-            a1_start = rowcol_to_a1(s, col_idx)
-            a1_end   = rowcol_to_a1(p, col_idx)
+            a1_start = gspread.utils.rowcol_to_a1(s, col_idx)
+            a1_end   = gspread.utils.rowcol_to_a1(p, col_idx)
             updates.append({"range": f"{ws.title}!{a1_start}:{a1_end}", "values": buf})
 
     # 执行批量值更新（不会破坏数据验证/条件格式/其它列）
@@ -1400,11 +1400,15 @@ with tab1:
                 if col not in tmp.columns:
                     tmp[col] = ""
             rows = tmp.reindex(columns=header_raw).fillna("").values.tolist()
+            # === 原来：成功 append_rows 之后的代码块，整段替换为下面这段 ===
+
             ws_track.append_rows(rows, value_input_option="USER_ENTERED")
 
             st.success(f"已上传 {len(rows)} 条到『{SHEET_SHIP_TRACKING}』。卡车单号：{pallet_truck_no}")
 
-            # 更新『运单全链路汇总』
+            # ✅ 先清缓存，再去构建增量并更新『运单全链路汇总』
+            st.cache_data.clear()
+
             try:
                 st.info("正在更新『运单全链路汇总』（只含『发货追踪』里的运单；仅更新指定列）…")
                 df_delta = build_waybill_delta()
@@ -1419,12 +1423,12 @@ with tab1:
             except Exception as e:
                 st.warning(f"更新『运单全链路汇总』失败：{e}")
 
-            # 上传成功后清缓存/解锁
-            st.cache_data.clear()
+            # ✅ 上传与汇总都处理完，再做解锁与重载
             st.session_state.sel_locked = False
             st.session_state.locked_df = pd.DataFrame()
             st.session_state.pop("pallet_select_editor", None)
             st.rerun()
+
     # ----------------------- 选择与计算片段结束 -----------------------
 
 with tab2:
@@ -1559,7 +1563,7 @@ with tab2:
 
     st.markdown(f"**匹配到 {len(df_target)} 条运单**")
     st.dataframe(
-        df_target[["运单号","仓库代码","发走卡车号","到仓日期"]]
+        df_target[["运单号","仓库代码","发走卡车号","发走日期","到仓日期"]]
             .sort_values(["仓库代码","发走卡车号","运单号"]),
         use_container_width=True, height=360
     )
