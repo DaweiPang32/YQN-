@@ -193,7 +193,7 @@ with tab1:
         st.stop()
 
     # 时间筛选（提货日期=ETA(到BCF)）
-    valid_dates = ship["提货日期"].dropna()
+    valid_dates = ship["提货日期"].dropna(
     if valid_dates.empty:
         st.info("未检测到有效的『提货日期』，将展示全部记录。")
         ship_f = ship.copy()
@@ -383,6 +383,15 @@ with tab2:
 
     st.markdown("### 🚚 发货信息汇总（按仓库）")
     show_ship = pd.concat([grp_ship, grand_ship], ignore_index=True)
+        # 调整列顺序：把「发货时效天」「妥投时效天」放在最后两列
+    desired_order = [
+        "仓库代码", "箱数合计", "体积合计", "收费重合计KG",
+        "发货费用合计", "单据数", "发货费用/KG",
+        "发货时效天", "妥投时效天"
+    ]
+    present = [c for c in desired_order if c in show_ship.columns]
+    others  = [c for c in show_ship.columns if c not in present]
+    show_ship = show_ship[present + others]
 
     def _fmt2(x): 
         return "" if pd.isna(x) else f"{x:,.2f}"
