@@ -193,7 +193,7 @@ with tab1:
         st.stop()
 
     # 时间筛选（提货日期=ETA(到BCF)）
-    valid_dates = ship["提货日期"].dropna(
+    valid_dates = ship["提货日期"].dropna()
     if valid_dates.empty:
         st.info("未检测到有效的『提货日期』，将展示全部记录。")
         ship_f = ship.copy()
