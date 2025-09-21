@@ -1199,11 +1199,15 @@ with tab1:
             st.stop()
 
         st.subheader("🧾 车次信息（托盘维度分摊）")
-        cc1, cc2 = st.columns([2,2])
+        cc1, cc2, cc3 = st.columns([2,2,2])
         with cc1:
             pallet_truck_no = st.text_input("卡车单号（必填）", key="pallet_truck_no")
         with cc2:
             pallet_total_cost = st.number_input("本车总费用（必填）", min_value=0.0, step=1.0, format="%.2f", key="pallet_total_cost")
+        with cc3:
+            # 新增：可选的发货日期（默认今天）
+            ship_date_input = st.date_input("发货日期（默认今天）", value=date.today(), key="pallet_ship_date")
+
 
         if not pallet_truck_no or pallet_total_cost <= 0:
             st.info("请填写卡车单号与本车总费用。")
@@ -1234,15 +1238,17 @@ with tab1:
         upload_df["分摊费用"] = upload_df["分摊费用"].map(lambda x: f"{x:.2f}")
         upload_df["总费用"] = upload_df["总费用"].map(lambda x: f"{x:.2f}")
         upload_df["托盘体积"] = pd.to_numeric(upload_df.get("托盘体积", pd.Series()), errors="coerce").round(2)
+        upload_df["上传发货日期（预览）"] = ship_date_input.strftime("%Y-%m-%d")
 
         preview_cols_pal = [
-            "卡车单号","仓库代码","托盘号","托盘重量","长(in)","宽(in)","高(in)","托盘体积",
+            "卡车单号","上传发货日期（预览）","仓库代码","托盘号","托盘重量","长(in)","宽(in)","高(in)","托盘体积",
             "托盘创建日期","托盘创建时间",
             "运单数量","运单清单",
             "对客承诺送仓时间","送仓时段差值(天)",
             "ETA/ATA(按运单)","ETD/ATD(按运单)",
             "分摊比例","分摊费用","总费用"
         ]
+
         for c in preview_cols_pal:
             if c not in upload_df.columns:
                 upload_df[c] = ""
@@ -1278,8 +1284,24 @@ with tab1:
                 st.stop()
 
             tmp = upload_df.copy()
-            if ("日期" in header_raw) and ("日期" not in tmp.columns):
-                tmp["日期"] = datetime.today().strftime("%Y-%m-%d")
+
+            # 选中的发货日期字符串
+            _ship_date_str = ship_date_input.strftime("%Y-%m-%d")
+
+            # 兼容多种表头写法：按顺序择一写入
+            _date_header_candidates = ["日期", "发货日期", "出仓日期", "Date", "ShipDate"]
+            date_col_to_use = None
+            for cand in _date_header_candidates:
+                if cand in header_raw:
+                    date_col_to_use = cand
+                    break
+
+            if date_col_to_use is not None:
+                tmp[date_col_to_use] = _ship_date_str
+            else:
+                # 如果目标表没有任何日期列，保留原逻辑：不强制新增列，但你也可以在此处自动加列
+                pass
+
 
             for col in header_raw:
                 if col not in tmp.columns:
