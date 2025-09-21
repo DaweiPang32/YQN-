@@ -1538,3 +1538,4 @@ with tab2:
                     st.success(f"已更新 {len(df_target)} 行的『到仓日期』为 {fill_date.strftime('%Y-%m-%d')}。")
                     _bust("wb_summary")
                     st.rerun()
+
