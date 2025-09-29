@@ -317,6 +317,61 @@ def load_arrivals_df(_bust=0):
             "_ETAATA_date"]
     return df[keep]
 
+
+@st.cache_data(ttl=300)
+def load_waybill_summary_df(_bust=0):
+    try:
+        ws = client.open(SHEET_WB_SUMMARY).sheet1
+    except SpreadsheetNotFound:
+        st.error(f"找不到工作表「{SHEET_WB_SUMMARY}」。")
+        return pd.DataFrame(), None, []
+    vals = _safe_get_all_values(
+        ws,
+        value_render_option="UNFORMATTED_VALUE",
+        date_time_render_option="SERIAL_NUMBER"
+    )
+    if not vals:
+        st.warning("『运单全链路汇总』为空。")
+        return pd.DataFrame(), ws, []
+
+    header_raw = vals[0]
+    df = pd.DataFrame(vals[1:], columns=header_raw) if len(vals) > 1 else pd.DataFrame(columns=header_raw)
+
+    def pick(colnames, cands):
+        for c in cands:
+            if c in colnames:
+                return c
+        return None
+
+    col_wb   = pick(df.columns, ["运单号","Waybill"])
+    col_wh   = pick(df.columns, ["仓库代码","仓库"])
+    col_trk  = pick(df.columns, ["发走卡车号","发走车号","发走卡车","卡车号","TruckNo","Truck"])
+    col_ship = pick(df.columns, ["发走日期","发货日期","出仓日期"])
+    col_eta  = pick(df.columns, ["到仓日期","到仓日","到仓(wh)"])
+
+    if col_wb   is None: df["运单号"]   = ""; col_wb   = "运单号"
+    if col_wh   is None: df["仓库代码"] = ""; col_wh   = "仓库代码"
+    if col_trk  is None: df["发走卡车号"] = ""; col_trk  = "发走卡车号"
+    if col_ship is None: df["发走日期"]  = ""; col_ship = "发走日期"
+    if col_eta  is None: df["到仓日期"]  = ""; col_eta  = "到仓日期"
+
+    df_work = df.rename(columns={
+        col_wb: "运单号",
+        col_wh: "仓库代码",
+        col_trk: "发走卡车号",
+        col_ship: "发走日期",
+        col_eta: "到仓日期",
+    }).copy()
+
+    df_work["_rowno"] = np.arange(2, 2 + len(df_work))
+    df_work["_发走日期_dt"] = df_work["发走日期"].apply(_parse_sheet_value_to_date)
+    df_work["_到仓日期_dt"] = df_work["到仓日期"].apply(_parse_sheet_value_to_date)
+
+    df_work["仓库代码"] = df_work["仓库代码"].astype(str).str.strip()
+    df_work["发走卡车号"] = df_work["发走卡车号"].astype(str).str.strip()
+
+    return df_work, ws, header_raw
+
 @st.cache_data(ttl=300)
 def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None, bol_cost_df: pd.DataFrame | None = None, _bust=0):
     """
@@ -1262,7 +1317,8 @@ with tab1:
         （最后一托盘自动调整几分钱差额，确保总额=本车总费用）
         """)
 
-        if st.button("📤 追加上传到『发货追踪』", key="btn_upload_pallet"):
+                # === 按钮A：仅上传到『发货追踪』，不立刻同步全链路 ===
+        if st.button("📤 仅上传到『发货追踪』", key="btn_upload_pallet_upload_only"):
             try:
                 ss = client.open(SHEET_SHIP_TRACKING); ws_track = ss.sheet1
             except SpreadsheetNotFound:
@@ -1278,7 +1334,7 @@ with tab1:
             header_norm = _norm_header(header_raw)
             header_norm_lower = [h.lower() for h in header_norm]
             need_ok = any(n in header_norm for n in ["托盘号","托盘编号"]) or \
-                      any(n in header_norm_lower for n in ["palletid","palletno","pallet编号"])
+                    any(n in header_norm_lower for n in ["palletid","palletno","pallet编号"])
             if not need_ok:
                 st.error("『发货追踪』缺少“托盘号”列（或等价列如 PalletID/PalletNo）。请先在目标表增加该列。")
                 st.stop()
@@ -1288,110 +1344,98 @@ with tab1:
             # 选中的发货日期字符串
             _ship_date_str = ship_date_input.strftime("%Y-%m-%d")
 
-            # 兼容多种表头写法：按顺序择一写入
+            # 兼容多种日期表头写法：按顺序择一写入
             _date_header_candidates = ["日期", "发货日期", "出仓日期", "Date", "ShipDate"]
             date_col_to_use = None
             for cand in _date_header_candidates:
                 if cand in header_raw:
                     date_col_to_use = cand
                     break
-
             if date_col_to_use is not None:
                 tmp[date_col_to_use] = _ship_date_str
-            else:
-                # 如果目标表没有任何日期列，保留原逻辑：不强制新增列，但你也可以在此处自动加列
-                pass
+            # 若目标表没有任何日期列，这里不强行加列，保持与现状一致
 
-
+            # 保证所有目标列都有
             for col in header_raw:
                 if col not in tmp.columns:
                     tmp[col] = ""
             rows = tmp.reindex(columns=header_raw).fillna("").values.tolist()
 
+            # 追加写入
             ws_track.append_rows(rows, value_input_option="USER_ENTERED")
-            st.success(f"已上传 {len(rows)} 条到『{SHEET_SHIP_TRACKING}』。卡车单号：{pallet_truck_no}")
+            st.success(f"✅ 已上传 {len(rows)} 条到『{SHEET_SHIP_TRACKING}』。卡车单号：{pallet_truck_no}")
 
-            # === 上传成功后：仅局部刷新，不清全站缓存 ===
+            # 写入后：局部 bust & 记录这次上传的关键信息，供按钮B使用
             _bust("ship_tracking")
             _ = load_ship_tracking_raw(_bust=_get_bust("ship_tracking"))
 
-            st.info("正在更新『运单全链路汇总』（只含『发货追踪』里的运单；仅更新指定列）…")
+            st.session_state["_last_upload_pallets"] = set(upload_df["托盘号"].astype(str).str.strip())
+            st.session_state["_last_upload_truck"] = str(pallet_truck_no).strip()
+            st.session_state["_last_upload_at"] = datetime.now()
+
+            st.info("下一步：点击下方“🔁 更新到『运单全链路汇总』”。")
+
+
+        # === 按钮B：从『发货追踪』更新/补写到『运单全链路汇总』 ===
+        disable_b = not bool(st.session_state.get("_last_upload_pallets"))
+        if st.button("🔁 更新到『运单全链路汇总』", key="btn_update_wb_summary", disabled=disable_b):
+            needed_pids = st.session_state.get("_last_upload_pallets", set())
+
+            # ① 可见性轮询：等待刚上传的托盘在读取端可见（避免读到旧快照）
+            def _wait_visibility(max_wait_s=6.0, poll_every=0.6) -> bool:
+                start = time.time()
+                while True:
+                    track_now = load_ship_tracking_raw(_bust=_get_bust("ship_tracking"))
+                    if not track_now.empty:
+                        seen_pids = set(track_now.get("托盘号","").astype(str).str.strip())
+                        if needed_pids & seen_pids:
+                            return True
+                    if time.time() - start > max_wait_s:
+                        return False
+                    time.sleep(poll_every)
+
+            visible = _wait_visibility()
+            if not visible:
+                st.info("提示：远端可能存在短暂一致性延迟，已继续尝试同步…")
+
+            # ② 构建增量并写入全链路
             try:
                 df_delta = build_waybill_delta()
-                if df_delta.empty:
-                    st.warning("没有可更新的数据（检查到仓/发货/自提表）。")
-                else:
-                    ok = upsert_waybill_summary_partial(df_delta)
-                    if ok:
-                        _bust("wb_summary")
-                        _ = load_waybill_summary_df(_bust=_get_bust("wb_summary"))
-                        st.success(f"已更新/新增 {len(df_delta)} 条到『{SHEET_WB_SUMMARY}』。")
-                    else:
-                        st.warning("未能写入『运单全链路汇总』：请先创建该表并确保首行包含“运单号”列。")
             except Exception as e:
-                st.warning(f"更新『运单全链路汇总』失败：{e}")
+                st.error(f"构建增量失败：{e}")
+                st.stop()
 
-            st.session_state.sel_locked = False
-            st.session_state.locked_df = pd.DataFrame()
-            st.session_state.pop("pallet_select_editor", None)
-            st.rerun()
+            # ③ 兜底：若本轮仍为空，轻微等待后重读再试一次
+            if df_delta.empty:
+                time.sleep(1.2)
+                _bust("ship_tracking")
+                _ = load_ship_tracking_raw(_bust=_get_bust("ship_tracking"))
+                try:
+                    df_delta = build_waybill_delta()
+                except Exception as e:
+                    st.error(f"二次构建增量失败：{e}")
+                    st.stop()
+
+            if df_delta.empty:
+                st.warning("没有可更新的运单：可能仍在远端延迟，或本次上传未包含可解析的运单号。稍后再试或刷新缓存。")
+            else:
+                try:
+                    ok = upsert_waybill_summary_partial(df_delta)
+                except Exception as e:
+                    st.error(f"写入『运单全链路汇总』失败：{e}")
+                    st.stop()
+
+                if ok:
+                    _bust("wb_summary")
+                    _ = load_waybill_summary_df(_bust=_get_bust("wb_summary"))
+                    st.success(f"✅ 已更新/新增 {len(df_delta)} 条到『{SHEET_WB_SUMMARY}』。")
+                else:
+                    st.warning("未能写入『运单全链路汇总』：请检查表头（需包含“运单号”）或权限。")
+
 
 with tab2:
     st.subheader("🚚 按卡车回填到仓日期（先选仓库 → 再选卡车）")
 
-    @st.cache_data(ttl=300)
-    def load_waybill_summary_df(_bust=0):
-        try:
-            ws = client.open(SHEET_WB_SUMMARY).sheet1
-        except SpreadsheetNotFound:
-            st.error(f"找不到工作表「{SHEET_WB_SUMMARY}」。")
-            return pd.DataFrame(), None, []
-        vals = _safe_get_all_values(
-            ws,
-            value_render_option="UNFORMATTED_VALUE",
-            date_time_render_option="SERIAL_NUMBER"
-        )
-        if not vals:
-            st.warning("『运单全链路汇总』为空。")
-            return pd.DataFrame(), ws, []
-
-        header_raw = vals[0]
-        df = pd.DataFrame(vals[1:], columns=header_raw) if len(vals) > 1 else pd.DataFrame(columns=header_raw)
-
-        def pick(colnames, cands):
-            for c in cands:
-                if c in colnames:
-                    return c
-            return None
-
-        col_wb   = pick(df.columns, ["运单号","Waybill"])
-        col_wh   = pick(df.columns, ["仓库代码","仓库"])
-        col_trk  = pick(df.columns, ["发走卡车号","发走车号","发走卡车","卡车号","TruckNo","Truck"])
-        col_ship = pick(df.columns, ["发走日期","发货日期","出仓日期"])
-        col_eta  = pick(df.columns, ["到仓日期","到仓日","到仓(wh)"])
-
-        if col_wb   is None: df["运单号"]   = ""; col_wb   = "运单号"
-        if col_wh   is None: df["仓库代码"] = ""; col_wh   = "仓库代码"
-        if col_trk  is None: df["发走卡车号"] = ""; col_trk  = "发走卡车号"
-        if col_ship is None: df["发走日期"]  = ""; col_ship = "发走日期"
-        if col_eta  is None: df["到仓日期"]  = ""; col_eta  = "到仓日期"
-
-        df_work = df.rename(columns={
-            col_wb: "运单号",
-            col_wh: "仓库代码",
-            col_trk: "发走卡车号",
-            col_ship: "发走日期",
-            col_eta: "到仓日期",
-        }).copy()
-
-        df_work["_rowno"] = np.arange(2, 2 + len(df_work))
-        df_work["_发走日期_dt"] = df_work["发走日期"].apply(_parse_sheet_value_to_date)
-        df_work["_到仓日期_dt"] = df_work["到仓日期"].apply(_parse_sheet_value_to_date)
-
-        df_work["仓库代码"] = df_work["仓库代码"].astype(str).str.strip()
-        df_work["发走卡车号"] = df_work["发走卡车号"].astype(str).str.strip()
-
-        return df_work, ws, header_raw
 
     df_sum, ws_sum, header_raw = load_waybill_summary_df(_bust=_get_bust("wb_summary"))
     if ws_sum is None or df_sum.empty:
@@ -1538,4 +1582,3 @@ with tab2:
                     st.success(f"已更新 {len(df_target)} 行的『到仓日期』为 {fill_date.strftime('%Y-%m-%d')}。")
                     _bust("wb_summary")
                     st.rerun()
-
