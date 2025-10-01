@@ -957,13 +957,28 @@ def _extract_pure_waybills(mixed: str) -> list[str]:
         out.append(token)
     return out
 
-def build_waybill_delta():
+def build_waybill_delta(track_override: pd.DataFrame | None = None):
     """
-    聚合到“运单粒度”的增量数据，供部分更新《运单全链路汇总》
+    聚合到“运单粒度”的增量数据。
+    track_override: 若提供，则优先使用这批“刚上传但尚未可见”的发货追踪行，
+                    再与线上读到的『发货追踪』合并去重。
     """
     arrivals = load_arrivals_df(_bust=_get_bust("arrivals"))
     bol      = load_bol_waybill_costs(_bust=_get_bust("bol_detail"))
     track    = load_ship_tracking_raw(_bust=_get_bust("ship_tracking"))
+
+    # === 新增：合并 override（托盘号/运单清单/卡车单号/分摊费用/日期）===
+    if track_override is None:
+        track_override = st.session_state.get("_track_override", None)
+
+    if isinstance(track_override, pd.DataFrame) and not track_override.empty:
+        need_cols = ["托盘号","运单清单","卡车单号","分摊费用","日期"]
+        track_override = track_override[[c for c in need_cols if c in track_override.columns]].copy()
+
+        tmp = pd.concat([track, track_override], ignore_index=True)
+        if all(c in tmp.columns for c in ["托盘号","卡车单号","日期"]):
+            tmp = tmp.drop_duplicates(subset=["托盘号","卡车单号","日期"], keep="last")
+        track = tmp
 
     wb_from_track = set()
     for _, r in track.iterrows():
@@ -1584,6 +1599,25 @@ with tab1:
             st.session_state["_last_upload_pallets"] = set(upload_df["托盘号"].astype(str).str.strip())
             st.session_state["_last_upload_truck"] = str(pallet_truck_no).strip()
             st.session_state["_last_upload_at"] = datetime.now()
+            # === 覆写缓存（本地直推）：把刚上传的“托盘→发货追踪”行，保存为读取端可用的临时数据 ===
+            override = upload_df[[
+                "托盘号","运单清单","自提仓库(按托盘)","分摊费用","上传发货日期（预览）","卡车单号"
+            ]].copy()
+
+            # 统一为 load_ship_tracking_raw() 的字段名
+            override = override.rename(columns={
+                "上传发货日期（预览）": "日期"
+            })
+
+            # 类型清洗
+            override["托盘号"]   = override["托盘号"].astype(str).str.strip()
+            override["卡车单号"] = override["卡车单号"].astype(str).str.strip()
+            # 分摊费用在 upload_df 是两位小数字符串，这里转为 float，后续运算更稳
+            override["分摊费用"] = override["分摊费用"].apply(lambda x: float(str(x)))
+            override["日期"]     = override["日期"].astype(str)
+            override["自提仓库(按托盘)"] = override["自提仓库(按托盘)"].astype(str).str.strip()
+
+            st.session_state["_track_override"] = override
 
             st.info("下一步：点击下方“🔁 更新到『运单全链路汇总』”。")
 
@@ -1610,11 +1644,13 @@ with tab1:
                 st.info("提示：远端可能存在短暂一致性延迟，已继续尝试同步…")
 
             # ② 构建增量并写入全链路
+            # ② 构建增量并写入全链路 —— 优先用 override（本地直推）
             try:
-                df_delta = build_waybill_delta()
+                df_delta = build_waybill_delta(track_override=st.session_state.get("_track_override"))
             except Exception as e:
                 st.error(f"构建增量失败：{e}")
                 st.stop()
+
 
             # ③ 兜底重读一次
             if df_delta.empty:
@@ -1805,3 +1841,4 @@ with tab2:
                         st.success(f"已更新 {len(df_target)} 行的『到仓日期』为 {fill_date.strftime('%Y-%m-%d')}。")
                         _bust("wb_summary")
                         st.rerun()
+
