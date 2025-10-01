@@ -162,7 +162,7 @@ def generate_pallet_id(warehouse: str | None = None) -> str:
 def load_ship_detail_df():
     """
     读取 bol自提明细（发货明细），作为收货展示的主数据源。
-    只保留：运单号 / 客户单号 / ETA(到BCF)。日期可能是字符串或序列号，这里统一解析为 datetime。
+    只保留：运单号 / 客户单号 / ETA(到自提仓) / 自提仓库。
     """
     try:
         ws = get_ws(SHEET_SHIP_DETAIL, "ship_detail_key")
@@ -179,8 +179,8 @@ def load_ship_detail_df():
     rows   = vals[1:]
     df = pd.DataFrame(rows, columns=header)
 
-    # 兜底需要列
-    for col in ["运单号", "客户单号", "ETA(到BCF)"]:
+    # 兜底需要列（新增：自提仓库）
+    for col in ["运单号", "客户单号", "ETA(到自提仓)", "自提仓库"]:
         if col not in df.columns:
             df[col] = pd.NA
 
@@ -188,15 +188,16 @@ def load_ship_detail_df():
     df = df[df["运单号"] != ""]
 
     # ETA 解析：尝试序列号，再 to_datetime
-    parsed_serial = df["ETA(到BCF)"].apply(excel_serial_to_date)
-    fallback      = pd.to_datetime(df["ETA(到BCF)"], errors="coerce")
-    df["ETA(到BCF)"] = parsed_serial.combine_first(fallback)
+    parsed_serial = df["ETA(到自提仓)"].apply(excel_serial_to_date)
+    fallback      = pd.to_datetime(df["ETA(到自提仓)"], errors="coerce")
+    df["ETA(到自提仓)"] = parsed_serial.combine_first(fallback)
 
     # 若同一运单出现多行（发货端可能多次追加），保留最后一条
     if not df.empty:
         df = df.groupby("运单号", as_index=False).last()
 
-    return df[["运单号", "客户单号", "ETA(到BCF)"]]
+    return df[["运单号", "客户单号", "ETA(到自提仓)", "自提仓库"]]
+
 
 @st.cache_data(ttl=300)
 def load_arrivals_df():
@@ -269,8 +270,8 @@ def load_uploaded_allocations(warehouse: str) -> dict:
     return agg
 
 # ========= 页面设置 =========
-st.set_page_config(page_title="物流收货平台（基于发货明细）", layout="wide")
-st.title("📦 BCF 收货托盘绑定（数据源：bol自提明细 + 到仓箱数）")
+st.set_page_config(page_title="物流收货平台", layout="wide")
+st.title("📦 收货与托盘绑定")
 
 # ========= 刷新缓存（软刷新，仅清数据加载函数） =========
 tools_l, _ = st.columns([1,6])
@@ -287,7 +288,7 @@ if "pallet_detail_records" not in st.session_state:
 
 # ========= 数据加载（捕获429友好提示） =========
 try:
-    ship_df    = load_ship_detail_df()   # 运单号 / 客户单号 / ETA(到BCF)
+    ship_df    = load_ship_detail_df()   # 运单号 / 客户单号 / ETA(到自提仓)
     arrivals   = load_arrivals_df()      # 运单号 / 仓库代码 / 箱数
 except APIError as e:
     code = getattr(e, "response", None).status_code if getattr(e, "response", None) else None
@@ -303,20 +304,20 @@ if ship_df.empty and arrivals.empty:
 
 # ========= 合并（以 bol自提明细 为主，左连到仓数据表的 仓库代码 / 箱数）=========
 merged_df = ship_df.merge(arrivals, on="运单号", how="left")
-# 确保 ETA(到BCF) 为 datetime
-merged_df["ETA(到BCF)"] = pd.to_datetime(merged_df["ETA(到BCF)"], errors="coerce")
+# 确保 ETA(到自提仓) 为 datetime
+merged_df["ETA(到自提仓)"] = pd.to_datetime(merged_df["ETA(到自提仓)"], errors="coerce")
 
-# ===== 日期筛选（按 ETA(到BCF)）=====
-valid_dates = merged_df["ETA(到BCF)"].dropna()
+# ===== 日期筛选（按 ETA(到自提仓)）=====
+valid_dates = merged_df["ETA(到自提仓)"].dropna()
 if valid_dates.empty:
-    st.warning("当前数据中没有可解析的 ETA(到BCF)。请检查源表或刷新缓存。")
+    st.warning("当前数据中没有可解析的 ETA(到自提仓)。请检查源表或刷新缓存。")
     st.stop()
 
 min_d = valid_dates.min().date()
 max_d = valid_dates.max().date()
 default_start = max(max_d - timedelta(days=14), min_d)
 
-st.markdown("### 🔎 按 ETA(到BCF) 日期筛选")
+st.markdown("### 🔎 按 ETA(到自提仓) 日期筛选")
 start_date, end_date = st.date_input(
     "选择日期范围（包含端点）",
     value=(default_start, max_d),
@@ -324,25 +325,43 @@ start_date, end_date = st.date_input(
     max_value=max_d
 )
 
-mask_date = merged_df["ETA(到BCF)"].between(pd.to_datetime(start_date), pd.to_datetime(end_date))
+mask_date = merged_df["ETA(到自提仓)"].between(pd.to_datetime(start_date), pd.to_datetime(end_date))
 merged_df_by_date = merged_df[mask_date].copy()
 
-# ===== 仓库筛选（基于日期过滤后的结果）=====
-warehouse_options = merged_df_by_date["仓库代码"].dropna().unique()
-if len(warehouse_options) == 0:
-    st.warning("当前日期范围内没有仓库数据，请调整日期范围。")
+# ===== 自提仓库筛选（第一步）=====
+pickup_options = merged_df_by_date["自提仓库"].dropna().astype(str).str.strip().unique().tolist()
+if not pickup_options:
+    st.warning("当前日期范围内没有自提仓库数据，请调整日期范围。")
     st.stop()
 
-warehouse = st.selectbox("选择仓库代码：", warehouse_options)
+pickup = st.selectbox("选择自提仓库：", options=pickup_options)
 
-# ===== 展示合并结果（已按日期与仓库过滤）=====
-display_cols = ["仓库代码", "运单号", "客户单号", "ETA(到BCF)", "箱数"]
+# ===== 仓库代码筛选（第二步，基于已选自提仓库过滤）=====
+warehouse_options = merged_df_by_date.loc[
+    merged_df_by_date["自提仓库"] == pickup, "仓库代码"
+].dropna().unique().tolist()
+
+if not warehouse_options:
+    st.warning("所选自提仓库下没有仓库数据，请调整选择。")
+    st.stop()
+
+warehouse = st.selectbox("选择仓库代码：", options=warehouse_options)
+
+# ===== 最终表（只一张总表）=====
+display_cols = ["自提仓库", "仓库代码", "运单号", "客户单号", "ETA(到自提仓)", "箱数"]
 use_cols = [c for c in display_cols if c in merged_df_by_date.columns]
-filtered_df = merged_df_by_date[merged_df_by_date["仓库代码"] == warehouse]
-filtered_df = filtered_df[use_cols].sort_values(by=["ETA(到BCF)", "运单号"], na_position="last")
 
-st.markdown("### 📋 已到 BCF 的待收货运单（已按日期与仓库过滤）")
+filtered_df = merged_df_by_date[
+    (merged_df_by_date["自提仓库"] == pickup) &
+    (merged_df_by_date["仓库代码"] == warehouse)
+].copy()
+
+filtered_df = filtered_df[use_cols].sort_values(by=["ETA(到自提仓)", "运单号"], na_position="last")
+
+st.markdown("### 📋 待收货运单（总表）")
 st.dataframe(filtered_df, use_container_width=True, height=320)
+
+
 
 # ========== 托盘绑定逻辑 ==========
 st.markdown("### 🧰 托盘操作")
@@ -565,18 +584,19 @@ for pallet_id in list(st.session_state["all_pallets"]):
                         continue
                     row = filtered_df[filtered_df["运单号"] == wb].iloc[0]
                     record = {
-                        "托盘号": pallet_id,
-                        "仓库代码": warehouse,
-                        "运单号": wb,
-                        "客户单号": row.get("客户单号", ""),
-                        "箱数": int(qty),
-                        "重量": weight,
-                        "长": length,
-                        "宽": width,
-                        "高": height,
-                        "ETA(到BCF)": row.get("ETA(到BCF)", ""),
-                        "类型": detail_type
-                    }
+                    "托盘号": pallet_id,
+                    "仓库代码": warehouse,
+                    "自提仓库": str(row.get("自提仓库", "") or "").strip(),  # 新增：带上自提仓库
+                    "运单号": wb,
+                    "客户单号": row.get("客户单号", ""),
+                    "箱数": int(qty),
+                    "重量": weight,
+                    "长": length,
+                    "宽": width,
+                    "高": height,
+                    "ETA(到自提仓)": row.get("ETA(到自提仓)", ""),
+                    "类型": detail_type
+                }
                     st.session_state["pallet_detail_records"].append(record)
 
                 st.success(f"✅ 托盘 {pallet_id} 绑定完成（{detail_type}）")
@@ -603,13 +623,15 @@ if st.session_state["pallet_detail_records"]:
 
     df_preview = pd.DataFrame(st.session_state["pallet_detail_records"]).copy()
 
-    # 惯用列顺序
-    base_cols = ["托盘号", "仓库代码", "运单号", "客户单号",
-                 "箱数", "重量", "长", "宽", "高", "ETA(到BCF)", "类型"]
+    base_cols = ["托盘号", "仓库代码", "自提仓库", "运单号", "客户单号",
+                "箱数", "重量", "长", "宽", "高", "ETA(到自提仓)", "类型"]
+
     for col in base_cols:
         if col not in df_preview.columns:
-            df_preview[col] = ""
-
+            if col == "ETA(到自提仓)":
+                df_preview[col] = pd.NaT       # 日期列用 NaT
+            else:
+                df_preview[col] = ""           # 其他列照旧
     df_preview = df_preview[base_cols]
 
     # 把“删除”放到最后一列
@@ -634,7 +656,7 @@ if st.session_state["pallet_detail_records"]:
             "长": st.column_config.NumberColumn(),
             "宽": st.column_config.NumberColumn(),
             "高": st.column_config.NumberColumn(),
-            "ETA(到BCF)": st.column_config.DatetimeColumn(),
+            "ETA(到自提仓)": st.column_config.DatetimeColumn(),
             "类型": st.column_config.TextColumn(disabled=True),
             "删除": st.column_config.CheckboxColumn("删除"),
         },
@@ -653,10 +675,11 @@ if st.session_state["pallet_detail_records"]:
                 kept = [r for i, r in enumerate(updated_records) if i not in to_delete_idx]
                 st.session_state["pallet_detail_records"] = kept
                 st.success(f"已删除 {len(to_delete_idx)} 条记录")
-                st.rerun()
+                st.rerun()            
             else:
                 st.info("未勾选要删除的记录。")
 
+    st.markdown("---")
 
     # ========== 上传托盘明细到 Google Sheets ==========
     c1, c2, _ = st.columns([2, 2, 6])
@@ -677,10 +700,10 @@ if st.session_state["pallet_detail_records"]:
 
             # 日期列转字符串（含 ETA 列）
             dt_cols = df_upload.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns.tolist()
-            if "ETA(到BCF)" in df_upload.columns and df_upload["ETA(到BCF)"].dtype == object:
-                df_upload["ETA(到BCF)"] = pd.to_datetime(df_upload["ETA(到BCF)"], errors="coerce")
-                if "ETA(到BCF)" not in dt_cols:
-                    dt_cols.append("ETA(到BCF)")
+            if "ETA(到自提仓)" in df_upload.columns and df_upload["ETA(到自提仓)"].dtype == object:
+                df_upload["ETA(到自提仓)"] = pd.to_datetime(df_upload["ETA(到自提仓)"], errors="coerce")
+                if "ETA(到自提仓)" not in dt_cols:
+                    dt_cols.append("ETA(到自提仓)")
             for c in dt_cols:
                 df_upload[c] = df_upload[c].dt.strftime("%Y-%m-%d").fillna("")
 
