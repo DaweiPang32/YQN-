@@ -853,38 +853,72 @@ def load_ship_tracking_raw(_bust=0):
         ws = client.open(SHEET_SHIP_TRACKING).sheet1
     except SpreadsheetNotFound:
         return pd.DataFrame()
+
     vals = _safe_get_all_values(
         ws,
         value_render_option="UNFORMATTED_VALUE",
         date_time_render_option="SERIAL_NUMBER"
     )
-    if not vals: return pd.DataFrame()
-    header = _norm_header(vals[0])
-    df = pd.DataFrame(vals[1:], columns=header) if len(vals)>1 else pd.DataFrame(columns=header)
+    if not vals:
+        return pd.DataFrame()
 
+    header = _norm_header(vals[0])
+    df = pd.DataFrame(vals[1:], columns=header) if len(vals) > 1 else pd.DataFrame(columns=header)
+
+    # ---- 列名统一（不含费用列；费用列下面单独用 cost_col 选择）----
     if "托盘号" not in df.columns:
         for c in ["托盘编号","PalletID","PalletNo","palletid","palletno"]:
-            if c in df.columns: df = df.rename(columns={c:"托盘号"}); break
+            if c in df.columns:
+                df = df.rename(columns={c: "托盘号"})
+                break
+
     if "运单清单" not in df.columns:
         for c in ["运单号清单","运单列表","Waybills","waybills"]:
-            if c in df.columns: df = df.rename(columns={c:"运单清单"}); break
+            if c in df.columns:
+                df = df.rename(columns={c: "运单清单"})
+                break
+
     if "卡车单号" not in df.columns:
         for c in ["TruckNo","truckno","Truck","truck","卡车号"]:
-            if c in df.columns: df = df.rename(columns={c:"卡车单号"}); break
-    if "分摊费用" not in df.columns:
-        for c in ["费用","Amount","amount","cost"]:
-            if c in df.columns: df = df.rename(columns={c:"分摊费用"}); break
-    if "日期" not in df.columns:
-        for c in ["Date","date"]:
-            if c in df.columns: df = df.rename(columns={c:"日期"}); break
+            if c in df.columns:
+                df = df.rename(columns={c: "卡车单号"})
+                break
 
-    df["托盘号"]   = df.get("托盘号","").astype(str).str.strip()
-    df["卡车单号"] = df.get("卡车单号","").astype(str).str.strip()
-    df["分摊费用"] = df.get("分摊费用","").apply(_to_num_safe)
-    df["日期_raw"] = df.get("日期","")
+    # 日期：支持多种表头并统一
+    if "日期" not in df.columns:
+        for c in ["发货日期","出仓日期","ShipDate","Date","date"]:
+            if c in df.columns:
+                df = df.rename(columns={c: "日期"})
+                break
+
+    # ---- 基本清洗 ----
+    df["托盘号"]   = df.get("托盘号", "").astype(str).str.strip()
+    df["卡车单号"] = df.get("卡车单号", "").astype(str).str.strip()
+    df["运单清单"] = df.get("运单清单", "")
+
+    # 日期解析为 YYYY-MM-DD
+    df["日期_raw"] = df.get("日期", "")
     df["_date"]    = df["日期_raw"].apply(_parse_sheet_value_to_date)
     df["日期"]     = df["_date"].apply(_fmt_date).replace("", pd.NA)
-    df["运单清单"] = df.get("运单清单","")
+
+    # ---- 成本列统一处理（关键）----
+    cost_col = None
+    if "分摊费用" in df.columns:
+        cost_col = "分摊费用"
+    else:
+        for c in ["费用", "Amount", "amount", "cost"]:
+            if c in df.columns:
+                cost_col = c
+                break
+
+    if cost_col is None:
+        df["分摊费用"] = np.nan
+    else:
+        # 如果不是“分摊费用”，复制到标准列；若已是分摊费用则保持不变
+        if cost_col != "分摊费用":
+            df["分摊费用"] = df[cost_col]
+    df["分摊费用"] = df["分摊费用"].apply(_to_num_safe)
+
     return df[["托盘号","运单清单","卡车单号","分摊费用","日期"]]
 
 @st.cache_data(ttl=300)
@@ -974,12 +1008,38 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
     if isinstance(track_override, pd.DataFrame) and not track_override.empty:
         need_cols = ["托盘号","运单清单","卡车单号","分摊费用","日期"]
         track_override = track_override[[c for c in need_cols if c in track_override.columns]].copy()
+        track = pd.concat([track, track_override], ignore_index=True)
 
-        tmp = pd.concat([track, track_override], ignore_index=True)
-        if all(c in tmp.columns for c in ["托盘号","卡车单号","日期"]):
-            tmp = tmp.drop_duplicates(subset=["托盘号","卡车单号","日期"], keep="last")
-        track = tmp
+    # === 关键修复：进入分摊前对 track 做“强标准化 + 去重”，避免同一托盘同一卡车被算两次 ===
+    def _norm_pid(s):
+        return str(s).strip().upper() if pd.notna(s) else ""
 
+    def _norm_trk(s):
+        s = str(s).strip().upper() if pd.notna(s) else ""
+        return s.replace(" ", "").replace("-", "")
+
+    def _norm_day(s):
+        dt = _parse_sheet_value_to_date(s)
+        return _fmt_date(dt) if dt else ""
+
+    if not track.empty:
+        track = track.copy()
+        track["_pid_k"] = track.get("托盘号","").map(_norm_pid)
+        track["_trk_k"] = track.get("卡车单号","").map(_norm_trk)
+        track["_day_k"] = track.get("日期","").map(_norm_day)
+
+        # 1) 先按 (托盘, 卡车, 日期) 去重
+        track = track[~track.duplicated(subset=["_pid_k","_trk_k","_day_k"], keep="last")].copy()
+
+        # 2) 对“日期为空”的重复，再按 (托盘, 卡车, round(分摊费用,2)) 兜底去重
+        if "分摊费用" in track.columns:
+            track["_cost2"] = pd.to_numeric(track["分摊费用"], errors="coerce").round(2)
+            dup2 = track["_day_k"].eq("") & track.duplicated(subset=["_pid_k","_trk_k","_cost2"], keep="last")
+            track = track[~dup2].copy()
+
+        track.drop(columns=["_pid_k","_trk_k","_day_k","_cost2"], errors="ignore", inplace=True)
+
+    # === 之后保持你的原逻辑 ===
     wb_from_track = set()
     for _, r in track.iterrows():
         for wb in _extract_pure_waybills(r.get("运单清单", "")):
@@ -1034,6 +1094,7 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
                     wb2_date[wb] = dt_obj
 
     out = pd.DataFrame({"运单号": sorted(wb_from_track)})
+
     # 自提仓库（运单级）来自 BOL 自提明细映射
     pickup_map = load_bol_pickup_map(_bust=_get_bust("bol_detail"))
     out["自提仓库"] = out["运单号"].map(lambda wb: pickup_map.get(wb, pd.NA))
@@ -1082,10 +1143,10 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
     out["发走卡车号"] = out["运单号"].map(lambda wb: ", ".join(sorted(wb2_trucks.get(wb, []))) if wb in wb2_trucks else pd.NA)
     out["发走日期"]   = out["运单号"].map(lambda wb: _fmt_date(wb2_date.get(wb)) if wb in wb2_date else pd.NA)
 
-    out["收费重"]   = pd.to_numeric(out["收费重"], errors="coerce")
-    out["体积"]     = pd.to_numeric(out["体积"], errors="coerce").round(2)
-    out["到自提仓库费用"] = pd.to_numeric(out["到自提仓库费用"], errors="coerce").round(2)
-    out["发走费用"]  = pd.to_numeric(out["发走费用"], errors="coerce").round(2)
+    out["收费重"]        = pd.to_numeric(out["收费重"], errors="coerce")
+    out["体积"]          = pd.to_numeric(out["体积"], errors="coerce").round(2)
+    out["到自提仓库费用"]  = pd.to_numeric(out["到自提仓库费用"], errors="coerce").round(2)
+    out["发走费用"]       = pd.to_numeric(out["发走费用"], errors="coerce").round(2)
 
     final_cols = [
         "运单号","客户单号","仓库代码","自提仓库","收费重","体积",
@@ -1098,6 +1159,7 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
         if c not in out.columns:
             out[c] = pd.NA
     return out[final_cols]
+
 
 MANAGED_COLS = [
     "运单号","客户单号",
@@ -1841,4 +1903,3 @@ with tab2:
                         st.success(f"已更新 {len(df_target)} 行的『到仓日期』为 {fill_date.strftime('%Y-%m-%d')}。")
                         _bust("wb_summary")
                         st.rerun()
-
