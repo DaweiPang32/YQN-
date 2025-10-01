@@ -1730,6 +1730,11 @@ with tab1:
             else:
                 try:
                     ok = upsert_waybill_summary_partial(df_delta)
+                    if ok:
+                        # ✅ 成功写入后清理本地缓存，避免下一次重复叠加
+                        if "_track_override" in st.session_state:
+                            del st.session_state["_track_override"]
+                        st.success("✅ 已更新到『运单全链路汇总』")
                 except Exception as e:
                     st.error(f"写入『运单全链路汇总』失败：{e}")
                     st.stop()
