@@ -5,7 +5,7 @@
 # - 对客承诺送仓时间如“19-21”→ 与今天的天数差：x-y（锚定 ETA/ATA 的月份，缺失用当月）
 # - 已发托盘读取自『发货追踪』，再次进入页面自动隐藏
 # - 上传到『发货追踪』后，自动【部分更新】『运单全链路汇总』
-#   仅更新以下列：客户单号、发出(ETD/ATD)、到港(ETA/ATA)、到BCF日期、到BCF卡车号、到BCF费用、发走日期、发走卡车号、发走费用
+#   仅更新以下列：客户单号、发出(ETD/ATD)、到港(ETA/ATA)、到自提仓库日期、到自提仓库卡车号、到自提仓库费用、发走日期、发走卡车号、发走费用
 # - 只针对『发货追踪』里出现过的运单号进行汇总/更新
 # - 兼容『bol自提明细』/『发货追踪』实际列名（卡车号/费用/日期/客户单号等）
 # - 新增：在托盘展示中显示《托盘明细表》提交时写入的【托盘创建日期 / 托盘创建时间】
@@ -45,7 +45,7 @@ client = get_gspread_client()
 SHEET_ARRIVALS_NAME   = "到仓数据表"       # ETD/ATD、ETA/ATA（合并）、对客承诺送仓时间、预计到仓时间（日）
 SHEET_PALLET_DETAIL   = "托盘明细表"       # 托盘数据（重量/体积来自此表；体积由 L/W/H(inch) 计算为 CBM）
 SHEET_SHIP_TRACKING   = "发货追踪"         # 托盘维度出仓记录（分摊到托盘）
-SHEET_BOL_DETAIL      = "bol自提明细"      # 到BCF 明细（分摊到运单）
+SHEET_BOL_DETAIL      = "bol自提明细"      # 到自提仓库 明细（分摊到运单）
 SHEET_WB_SUMMARY      = "运单全链路汇总"    # 仅部分更新
 
 # ========= 通用工具 =========
@@ -848,78 +848,64 @@ def load_bol_waybill_costs(_bust=0):
 
 
 @st.cache_data(ttl=300)
-def load_ship_tracking_raw(_bust=0):
+def load_ship_tracking_raw(_bust=0, sheet_sig: int = 0):
     try:
         ws = client.open(SHEET_SHIP_TRACKING).sheet1
     except SpreadsheetNotFound:
         return pd.DataFrame()
-
     vals = _safe_get_all_values(
         ws,
         value_render_option="UNFORMATTED_VALUE",
         date_time_render_option="SERIAL_NUMBER"
     )
-    if not vals:
+    if not vals: 
         return pd.DataFrame()
 
     header = _norm_header(vals[0])
-    df = pd.DataFrame(vals[1:], columns=header) if len(vals) > 1 else pd.DataFrame(columns=header)
+    df = pd.DataFrame(vals[1:], columns=header) if len(vals)>1 else pd.DataFrame(columns=header)
 
-    # ---- 列名统一（不含费用列；费用列下面单独用 cost_col 选择）----
+    # --- 列名统一 ---
     if "托盘号" not in df.columns:
         for c in ["托盘编号","PalletID","PalletNo","palletid","palletno"]:
-            if c in df.columns:
-                df = df.rename(columns={c: "托盘号"})
-                break
-
+            if c in df.columns: df = df.rename(columns={c:"托盘号"}); break
     if "运单清单" not in df.columns:
         for c in ["运单号清单","运单列表","Waybills","waybills"]:
-            if c in df.columns:
-                df = df.rename(columns={c: "运单清单"})
-                break
-
+            if c in df.columns: df = df.rename(columns={c:"运单清单"}); break
     if "卡车单号" not in df.columns:
         for c in ["TruckNo","truckno","Truck","truck","卡车号"]:
-            if c in df.columns:
-                df = df.rename(columns={c: "卡车单号"})
-                break
-
-    # 日期：支持多种表头并统一
+            if c in df.columns: df = df.rename(columns={c:"卡车单号"}); break
+    # 日期列统一：发货日期/出仓日期/ShipDate/Date/date -> 日期
     if "日期" not in df.columns:
         for c in ["发货日期","出仓日期","ShipDate","Date","date"]:
-            if c in df.columns:
-                df = df.rename(columns={c: "日期"})
-                break
+            if c in df.columns: df = df.rename(columns={c:"日期"}); break
 
-    # ---- 基本清洗 ----
-    df["托盘号"]   = df.get("托盘号", "").astype(str).str.strip()
-    df["卡车单号"] = df.get("卡车单号", "").astype(str).str.strip()
-    df["运单清单"] = df.get("运单清单", "")
+    # --- 基本清洗 ---
+    df["托盘号"]   = df.get("托盘号","").astype(str).str.strip()
+    df["卡车单号"] = df.get("卡车单号","").astype(str).str.strip()
+    df["运单清单"] = df.get("运单清单","")
 
-    # 日期解析为 YYYY-MM-DD
-    df["日期_raw"] = df.get("日期", "")
+    df["日期_raw"] = df.get("日期","")
     df["_date"]    = df["日期_raw"].apply(_parse_sheet_value_to_date)
     df["日期"]     = df["_date"].apply(_fmt_date).replace("", pd.NA)
 
-    # ---- 成本列统一处理（关键）----
+    # --- 成本列统一：优先“分摊费用”，没有才回退 ---
     cost_col = None
     if "分摊费用" in df.columns:
         cost_col = "分摊费用"
     else:
-        for c in ["费用", "Amount", "amount", "cost"]:
+        for c in ["费用","Amount","amount","cost"]:
             if c in df.columns:
                 cost_col = c
                 break
-
     if cost_col is None:
         df["分摊费用"] = np.nan
     else:
-        # 如果不是“分摊费用”，复制到标准列；若已是分摊费用则保持不变
         if cost_col != "分摊费用":
             df["分摊费用"] = df[cost_col]
     df["分摊费用"] = df["分摊费用"].apply(_to_num_safe)
 
     return df[["托盘号","运单清单","卡车单号","分摊费用","日期"]]
+
 
 @st.cache_data(ttl=300)
 def load_customer_refs_from_arrivals(_bust=0):
@@ -999,7 +985,13 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
     """
     arrivals = load_arrivals_df(_bust=_get_bust("arrivals"))
     bol      = load_bol_waybill_costs(_bust=_get_bust("bol_detail"))
-    track    = load_ship_tracking_raw(_bust=_get_bust("ship_tracking"))
+
+    # ✅ 用『发货追踪』当前行数签名参与缓存键——删除/新增行即时生效
+    ship_track_sig = _sheet_row_sig(SHEET_SHIP_TRACKING, _bust=_get_bust("ship_tracking"))
+    track = load_ship_tracking_raw(
+        _bust=_get_bust("ship_tracking"),
+        sheet_sig=ship_track_sig
+    )
 
     # === 新增：合并 override（托盘号/运单清单/卡车单号/分摊费用/日期）===
     if track_override is None:
@@ -1376,10 +1368,11 @@ with tab1:
         if st.button("🔄 刷新数据", key="btn_refresh_all"):
             for k in ["pallet_detail", "ship_tracking", "arrivals", "bol_detail", "wb_summary"]:
                 _bust(k)
-            for k in ["sel_locked", "locked_df", "_last_upload_pallets", "_last_upload_truck", "_last_upload_at", "all_snapshot_df"]:
+            for k in ["sel_locked", "locked_df", "_last_upload_pallets", "_last_upload_truck", "_last_upload_at", "all_snapshot_df", "_track_override"]:
                 if k in st.session_state:
                     del st.session_state[k]
             st.rerun()
+
 
     # 可选：先读依赖表，再注入到托盘读取，减少重复读
     arrivals_df = load_arrivals_df(_bust=_get_bust("arrivals"))
@@ -1738,6 +1731,7 @@ with tab1:
                 except Exception as e:
                     st.error(f"写入『运单全链路汇总』失败：{e}")
                     st.stop()
+
 
                 if ok:
                     # ===== 补丁A：写入成功后立刻刷新并重跑，保证切到 Tab2 看到新数据 =====
