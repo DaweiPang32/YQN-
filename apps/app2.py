@@ -1366,12 +1366,18 @@ with tab1:
     c1,_ = st.columns([1,6])
     with c1:
         if st.button("🔄 刷新数据", key="btn_refresh_all"):
+            # 1) 轻量 bust：让依赖数据的 cache key 变更
             for k in ["pallet_detail", "ship_tracking", "arrivals", "bol_detail", "wb_summary"]:
                 _bust(k)
-            for k in ["sel_locked", "locked_df", "_last_upload_pallets", "_last_upload_truck", "_last_upload_at", "all_snapshot_df", "_track_override"]:
+            # 2) 清 session_state（注意多了 "_track_override"）
+            for k in [
+                "sel_locked", "locked_df", "_last_upload_pallets", "_last_upload_truck",
+                "_last_upload_at", "all_snapshot_df", "_track_override"
+            ]:
                 if k in st.session_state:
                     del st.session_state[k]
             st.rerun()
+
 
 
     # 可选：先读依赖表，再注入到托盘读取，减少重复读
