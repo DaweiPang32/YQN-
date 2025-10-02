@@ -17,6 +17,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import SpreadsheetNotFound, APIError
 from googleapiclient.discovery import build
+from streamlit.errors import StreamlitAPIException
 from googleapiclient.errors import HttpError
 from datetime import datetime, timedelta, date
 import calendar
@@ -26,6 +27,15 @@ import math
 
 # ========= 授权范围 =========
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+
+if not st.session_state.get("_page_configured", False):
+    try:
+        st.set_page_config(page_title="发货调度", layout="wide")
+    except StreamlitAPIException:
+        # 已有其它页面/模块设置过，忽略重复设置
+        pass
+    st.session_state["_page_configured"] = True
+# ==============================================
 
 # ========= 预编译正则 =========
 _RE_PARENS = re.compile(r"[\(\（][\s\S]*?[\)\）]", re.DOTALL)
@@ -1520,7 +1530,6 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
 
 
 # ========= UI：仅启用“按托盘发货” + 「按卡车回填到仓日期」 =========
-st.set_page_config(page_title="发货调度", layout="wide")
 st.title("🚚 发货调度")
 
 # ======= 上传按钮放大 + 高亮样式（全局）=======
