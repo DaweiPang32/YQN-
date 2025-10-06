@@ -94,40 +94,59 @@ def load_ship_detail_df():
     header = _norm_cols(data[0])
     df = pd.DataFrame(data[1:], columns=header)
 
-    # 列名兼容
-    if "运单号" not in df.columns: df["运单号"] = pd.NA
+    # 兼容列名
+    if "运单号" not in df.columns:
+        df["运单号"] = pd.NA
+
     fee_col = "分摊费用" if "分摊费用" in df.columns else ("提货费用" if "提货费用" in df.columns else None)
     if fee_col is None:
         df["分摊费用"] = pd.NA
         fee_col = "分摊费用"
+
     if "ETA(到自提仓)" not in df.columns:
         df["ETA(到自提仓)"] = pd.NA
 
+    # 自提仓库（兼容别名）
+    pickup_col = _pick(df.columns, ["自提仓库","自提仓","BCF仓库","自提仓-名称"])
+    if pickup_col is None:
+        df["自提仓库"] = pd.NA
+    else:
+        df["自提仓库"] = df[pickup_col]
+
+    # 规范化
     df["运单号"] = df["运单号"].astype(str).str.strip()
     df["提货费用"] = _to_num(df[fee_col])
     df["提货日期"] = _parse_date_series(df["ETA(到自提仓)"])
+    df["自提仓库"] = df["自提仓库"].astype(str).str.strip()
 
+    # 返回列（有仓库代码就带上）
+    base_cols = ["运单号","提货费用","提货日期","自提仓库"]
     if "仓库代码" in df.columns:
-        return df[["运单号","提货费用","提货日期","仓库代码"]]
-    return df[["运单号","提货费用","提货日期"]]
+        return df[base_cols + ["仓库代码"]]
+    return df[base_cols]
+
 
 # ====== 读取：运单全链路汇总（发货信息） ======
 @st.cache_data(ttl=60)
 def load_wb_summary_df():
-    """从《运单全链路汇总》读取发货侧所需列，并做宽松列名兼容与类型清洗"""
+    """从《运单全链路汇总》读取发货侧所需列（含“自提仓库”），做宽松列名兼容与类型清洗"""
     try:
         ws = client.open(SHEET_WB_SUMMARY_NAME).sheet1
     except SpreadsheetNotFound:
         return pd.DataFrame()
+
     vals = ws.get_all_values(
         value_render_option="UNFORMATTED_VALUE",
         date_time_render_option="SERIAL_NUMBER",
     )
     if not vals:
         return pd.DataFrame()
-    header = _norm_cols(vals[0])
-    df = pd.DataFrame(vals[1:], columns=vals[0])
 
+    # ✅ 用规范后的表头（修复原来没用 header 的小 bug）
+    header_norm = _norm_cols(vals[0])
+    df = pd.DataFrame(vals[1:], columns=header_norm)
+
+    # 关键列定位（宽松匹配）
     col_wb   = _pick(df.columns, ["运单号","Waybill"])
     col_wh   = _pick(df.columns, ["仓库代码","仓库"])
     col_fee  = _pick(df.columns, ["发走费用","发货费用","出仓费用","发车费用"])
@@ -137,40 +156,44 @@ def load_wb_summary_df():
     col_box  = _pick(df.columns, ["箱数","箱子数"])
     col_cbm  = _pick(df.columns, ["体积","CBM","体积CBM"])
     col_wt   = _pick(df.columns, ["收费重","计费重","重量","收费重KG","计费重KG"])
+    # ✅ 自提仓库列（只从总表取）
+    col_pick = _pick(df.columns, ["自提仓库","BCF仓库","到自提仓库","自提仓"])
 
+    # 兜底并重命名
     for need, col in [("运单号", col_wb), ("仓库代码", col_wh)]:
-        if col is None: df[need] = ""
+        if col is None:
+            df[need] = ""
     df2 = df.rename(columns={
         (col_wb or "运单号"): "运单号",
         (col_wh or "仓库代码"): "仓库代码",
     })
 
-    # 费用
-    if col_fee is None: df2["发走费用"] = pd.NA
-    else: df2["发走费用"] = _to_num(df[col_fee])
+    # 数值列
+    df2["发走费用"] = _to_num(df[col_fee]) if col_fee else pd.NA
+    df2["箱数"]   = _to_num(df[col_box]) if col_box else pd.NA
+    df2["体积"]   = _to_num(df[col_cbm]) if col_cbm else pd.NA
+    df2["收费重"] = _to_num(df[col_wt])  if col_wt  else pd.NA
 
-    # 日期
+    # 日期列
     def _parse_col(cname):
-        if cname and cname in df.columns:
-            return _parse_date_series(df[cname])
-        return pd.Series([pd.NaT]*len(df2))
+        return _parse_date_series(df[cname]) if cname else pd.Series([pd.NaT]*len(df2))
     df2["到BCF日期"] = _parse_col(col_arrb)
-    df2["发走日期"] = _parse_col(col_ship)
-    df2["到仓日期"] = _parse_col(col_arrw)
+    df2["发走日期"]  = _parse_col(col_ship)
+    df2["到仓日期"]  = _parse_col(col_arrw)
 
-    # 数量型（若总表缺失，先留空，稍后从《到仓数据表》补齐）
-    if col_box: df2["箱数"] = _to_num(df[col_box])
-    else:       df2["箱数"] = pd.NA
-    if col_cbm: df2["体积"] = _to_num(df[col_cbm])
-    else:       df2["体积"] = pd.NA
-    if col_wt:  df2["收费重"] = _to_num(df[col_wt])
-    else:       df2["收费重"] = pd.NA
+    # ✅ 自提仓库：仅使用总表里的值
+    if col_pick:
+        df2["自提仓库"] = df[col_pick].astype(str).str.strip().replace({"": pd.NA})
+    else:
+        df2["自提仓库"] = pd.NA
 
-    # 规范
+    # 规范 & 去重
     df2["运单号"] = df2["运单号"].astype(str).str.strip()
     df2["仓库代码"] = df2["仓库代码"].astype(str).str.strip()
     df2 = df2[df2["运单号"] != ""].drop_duplicates(subset=["运单号"])
-    return df2[["运单号","仓库代码","箱数","体积","收费重","发走费用","到BCF日期","发走日期","到仓日期"]]
+
+    return df2[["运单号","仓库代码","自提仓库","箱数","体积","收费重","发走费用","到BCF日期","发走日期","到仓日期"]]
+
 
 # ====== UI ======
 st.set_page_config(page_title="📦 BCF 发货汇总（按仓库）", layout="wide")
@@ -232,9 +255,17 @@ with tab1:
 
     # 仓库过滤（可选）
     wh_list = merged["仓库代码"].dropna().unique().tolist()
-    wh_pick = st.multiselect("筛选仓库（可多选，留空=全部）", options=sorted(wh_list), key="wh_pickup")
+    wh_pick = st.multiselect("筛选仓库", options=sorted(wh_list), key="wh_pickup")
     if wh_pick:
         merged = merged[merged["仓库代码"].isin(wh_pick)]
+
+    # 自提仓库过滤（可选）
+    if "自提仓库" in merged.columns:
+        pickup_list = merged["自提仓库"].dropna().unique().tolist()
+        pickup_pick = st.multiselect("自提仓库", options=sorted(pickup_list), key="pickup_warehouse")
+        if pickup_pick:
+            merged = merged[merged["自提仓库"].isin(pickup_pick)]
+
     if merged.empty:
         st.warning("筛选后无数据。")
         st.stop()
@@ -277,7 +308,7 @@ with tab1:
     st.dataframe(fmt_df, use_container_width=True, height=420)
 
     with st.expander("🔍 查看用于汇总的明细（提货）"):
-        cols = ["仓库代码","运单号","箱数","体积","收费重","提货费用","提货日期"]
+        cols = ["仓库代码","自提仓库","运单号","箱数","体积","收费重","提货费用","提货日期"]
         exist_cols = [c for c in cols if c in merged.columns]
         st.dataframe(
             merged[exist_cols].sort_values(["仓库代码","提货日期","运单号"], na_position="last"),
@@ -297,6 +328,10 @@ with tab2:
 
     wb_sum = load_wb_summary_df()
     arrivals2 = load_arrivals_df()
+    # 兼容自提仓库列（若存在于总表）
+    if "自提仓库" not in wb_sum.columns:
+        wb_sum["自提仓库"] = pd.NA
+    wb_sum["自提仓库"] = wb_sum["自提仓库"].astype(str).str.strip()
 
     if wb_sum.empty:
         st.warning(f"未能从『{SHEET_WB_SUMMARY_NAME}』读取到数据或缺少关键列。")
@@ -310,7 +345,8 @@ with tab2:
         for c in ["箱数","体积","收费重"]:
             if c in m.columns and f"{c}_arr" in m.columns:
                 m[c] = m[c].combine_first(m[f"{c}_arr"])
-        wb_sum = m[[ "运单号","仓库代码","箱数","体积","收费重","发走费用","到BCF日期","发走日期","到仓日期" ]]
+        wb_sum = m[["运单号","仓库代码","自提仓库","箱数","体积","收费重","发走费用","到BCF日期","发走日期","到仓日期"]]
+
 
     # 时间筛选（以“发走日期”为锚，更贴合发货侧运营周期）
     valid_ship = wb_sum["发走日期"].dropna()
@@ -334,9 +370,24 @@ with tab2:
 
     # 仓库过滤（可选）
     wh_list2 = wb_f["仓库代码"].dropna().unique().tolist()
-    wh_pick2 = st.multiselect("筛选仓库（可多选，留空=全部）", options=sorted(wh_list2), key="wh_ship")
+    wh_pick2 = st.multiselect("筛选仓库", options=sorted(wh_list2), key="wh_ship")
     if wh_pick2:
         wb_f = wb_f[wb_f["仓库代码"].isin(wh_pick2)]
+    if wb_f.empty:
+        st.warning("筛选后无数据。")
+        st.stop()
+
+    # 自提仓库过滤（可选）
+    pickup_options2 = (
+        wb_f.get("自提仓库", pd.Series(dtype=str))
+            .dropna().astype(str).str.strip()
+            .replace({"": pd.NA}).dropna()
+            .unique().tolist()
+    )
+    pickup_pick2 = st.multiselect("筛选自提仓库", options=sorted(pickup_options2), key="pickup_ship")
+    if pickup_pick2:
+        wb_f = wb_f[wb_f["自提仓库"].isin(pickup_pick2)]
+
     if wb_f.empty:
         st.warning("筛选后无数据。")
         st.stop()
@@ -398,11 +449,13 @@ with tab2:
         detail = wb_f.copy()
         detail["发货时效天"] = detail["_发货时效天"]
         detail["妥投时效天"] = detail["_妥投时效天"]
+        cols_show = ["仓库代码","自提仓库","运单号","箱数","体积","收费重","发走费用","到BCF日期","发走日期","到仓日期","发货时效天","妥投时效天"]
+        exist_cols = [c for c in cols_show if c in detail.columns]
         st.dataframe(
-            detail[["仓库代码","运单号","箱数","体积","收费重","发走费用","到BCF日期","发走日期","到仓日期","发货时效天","妥投时效天"]]
-                .sort_values(["仓库代码","发走日期","运单号"], na_position="last"),
+            detail[exist_cols].sort_values(["仓库代码","发走日期","运单号"], na_position="last"),
             use_container_width=True, height=360
         )
+
 
     csv2 = show_ship.to_csv(index=False).encode("utf-8-sig")
     st.download_button("⬇️ 下载汇总 CSV（发货）", data=csv2, file_name="bcf_warehouse_ship_summary.csv", mime="text/csv")
