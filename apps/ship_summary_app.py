@@ -331,7 +331,7 @@ with tab2:
     # 兼容自提仓库列（若存在于总表）
     if "自提仓库" not in wb_sum.columns:
         wb_sum["自提仓库"] = pd.NA
-    wb_sum["自提仓库"] = wb_sum["自提仓库"].astype(str).str.strip()
+    wb_sum["自提仓库"] = wb_sum["自提仓库"].astype("string").str.strip()
 
     if wb_sum.empty:
         st.warning(f"未能从『{SHEET_WB_SUMMARY_NAME}』读取到数据或缺少关键列。")
@@ -379,14 +379,25 @@ with tab2:
 
     # 自提仓库过滤（可选）
     pickup_options2 = (
-        wb_f.get("自提仓库", pd.Series(dtype=str))
-            .dropna().astype(str).str.strip()
-            .replace({"": pd.NA}).dropna()
-            .unique().tolist()
+        wb_f.get("自提仓库", pd.Series(dtype="string"))
+        .astype("string").str.strip()
+        # 👇 用 (?i) 表示正则忽略大小写，过滤各种“空值”形式
+        .replace(to_replace=r"(?i)^(na|n/a|null|none|-)$", value=pd.NA, regex=True)
+        .dropna()
+        .unique().tolist()
     )
-    pickup_pick2 = st.multiselect("筛选自提仓库", options=sorted(pickup_options2), key="pickup_ship")
+
+
+    pickup_pick2 = st.multiselect(
+        "筛选自提仓库",
+        options=sorted(pickup_options2),
+        key="pickup_ship"
+    )
+
     if pickup_pick2:
-        wb_f = wb_f[wb_f["自提仓库"].isin(pickup_pick2)]
+        wb_f = wb_f[wb_f["自提仓库"].astype("string").str.strip().isin(pickup_pick2)]
+
+
 
     if wb_f.empty:
         st.warning("筛选后无数据。")
