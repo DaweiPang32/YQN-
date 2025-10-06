@@ -73,11 +73,11 @@ def get_gspread_client():
 
 client, sheets_service = get_clients()
 # ========= 表名配置 =========
-SHEET_ARRIVALS_NAME   = "到仓数据表"       # ETD/ATD、ETA/ATA（合并）、对客承诺送仓时间、预计到仓时间（日）
+SHEET_ARRIVALS_NAME   = "到仓数据表test"       # ETD/ATD、ETA/ATA（合并）、对客承诺送仓时间、预计到仓时间（日）
 SHEET_PALLET_DETAIL   = "托盘明细表"       # 托盘数据（重量/体积来自此表；体积由 L/W/H(inch) 计算为 CBM）
-SHEET_SHIP_TRACKING   = "发货追踪"         # 托盘维度出仓记录（分摊到托盘）
+SHEET_SHIP_TRACKING   = "发货追踪test"         # 托盘维度出仓记录（分摊到托盘）
 SHEET_BOL_DETAIL      = "bol自提明细"      # 到自提仓库 明细（分摊到运单）
-SHEET_WB_SUMMARY      = "运单全链路汇总"    # 仅部分更新
+SHEET_WB_SUMMARY      = "运单全链路汇总test"    # 仅部分更新
 
 # ========= 通用工具 =========
 def _norm_header(cols):
@@ -154,6 +154,29 @@ def _safe_get_all_values(ws, value_render_option="UNFORMATTED_VALUE", date_time_
                 if i < len(backoffs):
                     continue
             raise
+# ==== 轻量 HTTP 退避调用（用于 Sheets API 原生调用）====
+def _with_backoff(fn, *args, **kwargs):
+    """
+    对 Google API 调用做最多 6 次指数退避（~0.3 + 0.6 + 1.2 + 2.4 + 4.8 + 6.0s）。
+    用于 values.get / values.batchGet / spreadsheets.get 等。
+    """
+    delays = [0.3, 0.6, 1.2, 2.4, 4.8, 6.0]
+    last_err = None
+    for i, d in enumerate([0.0] + delays):
+        if d > 0:
+            time.sleep(d + random.random() * 0.2)
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            # 只对 429/配额 做重试，其它错误抛出
+            msg = str(e)
+            if ("429" in msg) or ("Quota" in msg) or ("quota" in msg):
+                last_err = e
+                continue
+            raise
+    # 到这里说明重试已用尽
+    if last_err:
+        raise last_err
 
 # ==== 轻量 bust：只刷新相关缓存，不清全站 ====
 def _bust(name: str):
@@ -1021,7 +1044,9 @@ def load_ship_tracking_raw(_bust=0, sheet_sig=None) -> pd.DataFrame:
     df["分摊费用"] = pd.to_numeric(df["分摊费用"], errors="coerce").round(2)
 
     # 日期 -> YYYY-MM-DD
-    df["日期"] = pd.to_datetime(df["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df["_day_obj"] = df["日期"].apply(_parse_sheet_value_to_date)
+    df["日期"] = df["_day_obj"].apply(lambda d: d.strftime("%Y-%m-%d") if isinstance(d, date) else "")
+    df.drop(columns=["_day_obj"], inplace=True, errors="ignore")
 
     # 清理空托盘
     df = df[df["托盘号"].astype(str).str.strip() != ""]
@@ -1140,6 +1165,7 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
         ])
 
     # === 强标准化 + 去重（托盘/卡车/日期） ===
+    # === 强标准化 + 去重（托盘/卡车/日期） ===
     def _norm_pid(s):
         return str(s).strip().upper() if pd.notna(s) else ""
     def _norm_trk(s):
@@ -1157,11 +1183,20 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
     # 1) 先按 (托盘, 卡车, 日期) 去重
     track = track[~track.duplicated(subset=["_pid_k","_trk_k","_day_k"], keep="last")].copy()
 
-    # 2) 对“日期为空”的重复，再按 (托盘, 卡车, round(分摊费用,2)) 兜底去重
+    # ✅ 1.5) 新增：同一(托盘,卡车)如仍有两条（一个空日期、一个有日期），优先保留“有日期”的那条
+    track["_has_day"] = track["_day_k"].ne("")
+    track = (
+        track.sort_values(["_pid_k","_trk_k","_has_day"], ascending=[True, True, False])
+            .drop_duplicates(subset=["_pid_k","_trk_k"], keep="first")
+            .drop(columns=["_has_day"])
+    )
+
+    # 2) 兜底：对“日期仍为空”的重复，再按 (托盘, 卡车, round(分摊费用,2)) 去重
     if "分摊费用" in track.columns:
         track["_cost2"] = pd.to_numeric(track["分摊费用"], errors="coerce").round(2)
         dup2 = track["_day_k"].eq("") & track.duplicated(subset=["_pid_k","_trk_k","_cost2"], keep="last")
         track = track[~dup2].copy()
+
 
     # === 仅解析一次“运单清单”为列表 ===
     def _wb_list_from_row(s):
@@ -1309,7 +1344,11 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
     # 发走费用 / 发走卡车号 / 发走日期
     out["发走费用"]   = out["运单号"].map(lambda wb: round(wb2_cost.get(wb, 0.0), 2) if wb in wb2_cost else pd.NA)
     out["发走卡车号"] = out["运单号"].map(lambda wb: ", ".join(sorted(wb2_trucks.get(wb, []))) if wb in wb2_trucks else pd.NA)
-    out["发走日期"]   = out["运单号"].map(lambda wb: _fmt_date(wb2_date.get(wb)) if wb in wb2_date else pd.NA)
+    def _safe_fmt_date(d):
+        return _fmt_date(d) if isinstance(d, date) else pd.NA
+
+    out["发走日期"] = out["运单号"].map(lambda wb: _safe_fmt_date(wb2_date.get(wb)))
+
 
     # 数值清洗
     out["收费重"]        = pd.to_numeric(out["收费重"], errors="coerce")
@@ -1405,6 +1444,14 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
             if t not in seen:
                 seen.append(t)
         return MERGE_SEP.join(seen)
+    def _is_iso_date(s: str) -> bool:
+        try:
+            if not isinstance(s, str):
+                return False
+            pd.to_datetime(s, format="%Y-%m-%d", errors="raise")
+            return True
+        except Exception:
+            return False
 
     # --- 打开目标表 ---
     try:
@@ -1466,16 +1513,24 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
         rows_payload = []  # (row_no, [value])
 
         policy = WRITE_POLICY.get(col, "default")
+        is_date_col = col in ["到仓日期","发走日期","美仓备货完成日期","到自提仓库日期"]
 
         for wb in common:
             new_v = idx_delta.loc[wb, col]
-            if not _is_effective(new_v):
-                continue
+
+            # 日期列只允许合法 YYYY-MM-DD 字符串写入，避免 0/空 被表格格式化成 1970-01-01
+            if is_date_col:
+                if not _is_iso_date(str(new_v)):
+                    continue
+            else:
+                if not _is_effective(new_v):
+                    continue
+
             rno = int(idx_exist.loc[wb, "_rowno"])
             old_v = idx_exist.loc[wb, col] if col in idx_exist.columns else ""
 
             if policy == "blank_only":
-                if not _cell_blank(old_v):
+                if not (old_v is None or (isinstance(old_v, float) and pd.isna(old_v)) or (isinstance(old_v, str) and old_v.strip() == "")):
                     continue
                 write_v = new_v
             elif policy == "merge_set":
@@ -1490,6 +1545,7 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
 
         rows_payload.sort(key=lambda x: x[0])
         updates.extend(_pack_ranges_for_col(ws.title, col_idx, rows_payload))
+
 
     # === 批量写入（老数据更新，分批提交更稳） ===
     if updates:
