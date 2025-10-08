@@ -1159,7 +1159,7 @@ def _extract_pure_waybills_and_po(mixed: str):
         return wb_list, cust_map
 
     # 按中文/英文逗号、分号、顿号、竖线、斜杠等切分为“每个片段”
-    segs = re.split(r"[,\，;\；、\|/]+", str(mixed))
+    segs = re.split(r"[,\，;\；、\|]+", str(mixed))
     for seg in segs:
         seg = seg.strip()
         if not seg:
