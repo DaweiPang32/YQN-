@@ -38,7 +38,7 @@ if not st.session_state.get("_page_configured", False):
 # ==============================================
 
 # ========= 预编译正则 =========
-_RE_PARENS = re.compile(r"[\(\（][\s\S]*?[\)\）]", re.DOTALL)
+_RE_PARENS = re.compile(r"\(.*\)|（.*）", re.DOTALL)
 _RE_SPLIT = re.compile(r"[,\，;\；、\|\/\s]+")
 _RE_NUM = re.compile(r'[-+]?\d+(?:\.\d+)?')
 
