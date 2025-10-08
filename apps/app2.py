@@ -38,7 +38,7 @@ if not st.session_state.get("_page_configured", False):
 # ==============================================
 
 # ========= 预编译正则 =========
-_RE_PARENS = re.compile(r"\(.*\)|（.*）", re.DOTALL)
+_RE_PARENS = re.compile(r"[\(\（][\s\S]*?[\)\）]", re.DOTALL)
 _RE_SPLIT = re.compile(r"[,\，;\；、\|\/\s]+")
 _RE_NUM = re.compile(r'[-+]?\d+(?:\.\d+)?')
 
@@ -47,6 +47,54 @@ def _split_tokens(s: str) -> list[str]:
     if not isinstance(s, str):
         s = str(s) if s is not None else ""
     return [t for t in _RE_SPLIT.split(s) if t]
+def _remove_parens_iter(s: str) -> str:
+    """反复去掉半角/全角括号内的内容（支持嵌套），直到不能再去。"""
+    if not isinstance(s, str) or not s:
+        return ""
+    prev = None
+    out = s
+    while prev != out:
+        prev = out
+        # 先半角，再全角
+        out = re.sub(r"\([^()]*\)", "", out)
+        out = re.sub(r"（[^（）]*）", "", out)
+    return out
+
+def _first_balanced_paren_content(s: str) -> str | None:
+    """
+    返回字符串 s 中【第一个成对括号】内的完整内容（支持嵌套、支持全角/半角）。
+    优先匹配半角()；若未找到再尝试全角（）。
+    """
+    if not isinstance(s, str) or not s:
+        return None
+
+    # 半角
+    start = s.find("(")
+    if start != -1:
+        depth = 0
+        for i in range(start, len(s)):
+            ch = s[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return s[start+1:i].strip()
+
+    # 全角
+    start = s.find("（")
+    if start != -1:
+        depth = 0
+        for i in range(start, len(s)):
+            ch = s[i]
+            if ch == "（":
+                depth += 1
+            elif ch == "）":
+                depth -= 1
+                if depth == 0:
+                    return s[start+1:i].strip()
+    return None
+
 # ========= 客户端复用 =========
 @st.cache_resource
 def get_clients():
@@ -1098,6 +1146,56 @@ def load_customer_refs_from_pallet(_bust=0):
     return out[["运单号","客户单号"]]
 
 # ===================== 运单增量构建 =====================
+def _extract_pure_waybills_and_po(mixed: str):
+    """
+    输入整段“运单清单”cell，返回 (wb_list, cust_map_from_cell)
+      - wb_list: 解析出的运单号列表（括号去掉后再判定，避免跨段）
+      - cust_map_from_cell: {wb: 第一个括号的原样内容}
+        * 注意：不判断是不是 PO；只要在该段的第一个括号里，就原样写
+    """
+    wb_list = []
+    cust_map = {}
+    if _is_blank(mixed):
+        return wb_list, cust_map
+
+    # 按中文/英文逗号、分号、顿号、竖线、斜杠等切分为“每个片段”
+    segs = re.split(r"[,\，;\；、\|/]+", str(mixed))
+    for seg in segs:
+        seg = seg.strip()
+        if not seg:
+            continue
+
+        # 1) 取第一个括号的完整内容（支持嵌套；半角优先、再全角）
+        first_paren_text = _first_balanced_paren_content(seg)
+
+        # 2) 为了找 WB：把括号内容迭代删除，再做 token 判定
+        seg_no_paren = _remove_parens_iter(seg)
+        parts = _split_tokens(seg_no_paren)
+
+        found_wb_for_this_seg = None
+        for p in parts:
+            token = _norm_waybill_str(p)
+            if not token:
+                continue
+            # 排除以 IP 开头
+            if token.upper().startswith("IP"):
+                continue
+            # 必须字母+数字且长度>=8
+            if not (re.search(r"[A-Za-z]", token) and re.search(r"\d", token) and len(token) >= 8):
+                continue
+            wb_list.append(token)
+            # 把“该段的第一个 WB”和“该段的第一个括号文本”关联起来
+            if first_paren_text and (found_wb_for_this_seg is None):
+                cust_map[token] = first_paren_text
+                found_wb_for_this_seg = token
+
+    # 去重保序
+    seen = set(); out = []
+    for wb in wb_list:
+        if wb not in seen:
+            seen.add(wb); out.append(wb)
+    return out, cust_map
+
 def _extract_pure_waybills(mixed: str) -> list[str]:
     """
     从《发货追踪》的“运单清单”字段中提取纯运单号列表。
@@ -1165,7 +1263,6 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
         ])
 
     # === 强标准化 + 去重（托盘/卡车/日期） ===
-    # === 强标准化 + 去重（托盘/卡车/日期） ===
     def _norm_pid(s):
         return str(s).strip().upper() if pd.notna(s) else ""
     def _norm_trk(s):
@@ -1199,10 +1296,21 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
 
 
     # === 仅解析一次“运单清单”为列表 ===
-    def _wb_list_from_row(s):
-        # 兼容已清洗的 override（可能已是干净的字符串）
-        return _extract_pure_waybills(s)
-    track["_wb_list"] = track.get("运单清单","").map(_wb_list_from_row)
+    # === 同时解析“运单清单列表”与“第一个括号→客户单号覆盖表” ===
+    track = track.copy()
+    wb_lists = []
+    cust_override_map = {}  # {wb: 来自该段第一个括号的文本}
+
+    for _, r in track.iterrows():
+        wb_list, cell_map = _extract_pure_waybills_and_po(r.get("运单清单",""))
+        wb_lists.append(wb_list)
+        for k, v in (cell_map or {}).items():
+            if k and v:
+                cust_override_map[k] = v
+
+    track["_wb_list"] = wb_lists
+
+
 
     # === 汇总出本次涉及的运单集合 ===
     wb_from_track = set()
@@ -1312,27 +1420,76 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
         out["到港(ETA/ATA)"] = pd.NA
         out["到仓日期"]       = pd.NA
 
-    # 客户单号优先级：BOL(1) > 托盘(2) > 到仓(3)
-    cust_bol = bol[["运单号","客户单号"]] if (not bol.empty and "客户单号" in bol.columns) \
-               else pd.DataFrame(columns=["运单号","客户单号"])
-    cust_pal = load_customer_refs_from_pallet(_bust=_get_bust("pallet_detail"))
-    cust_arr = load_customer_refs_from_arrivals(_bust=_get_bust("arrivals"))
-    for d in (cust_pal, cust_arr):
-        if not d.empty:
-            d.drop_duplicates(subset=["运单号"], inplace=True)
-            d["运单号"] = d["运单号"].map(_norm_waybill_str)
-    cust_all = pd.concat(
-        [cust_bol.assign(_pri=1), cust_pal.assign(_pri=2), cust_arr.assign(_pri=3)],
-        ignore_index=True
-    )
+    # ==== 客户单号优先级：cell括号(0) > BOL(1) > 托盘(2) > 到仓(3) ====
+
+    def _build_cust_priority_map(cust_override_map: dict,
+                                bol_df: pd.DataFrame,
+                                wb_from_track: set[str]) -> pd.DataFrame:
+        frames = []
+
+        # 0) 来自“运单清单 cell 第一个括号”的覆盖
+        if cust_override_map:
+            cust_from_cell = pd.DataFrame(
+                [{"运单号": wb, "客户单号": po}
+                for wb, po in cust_override_map.items()
+                if po is not None and str(po).strip() != ""]
+            )
+            if not cust_from_cell.empty:
+                cust_from_cell["_pri"] = 0
+                frames.append(cust_from_cell)
+
+        # 1) BOL
+        if bol_df is not None and not bol_df.empty and "客户单号" in bol_df.columns:
+            tmp = bol_df[["运单号","客户单号"]].copy()
+            tmp["_pri"] = 1
+            frames.append(tmp)
+
+        # 2) 托盘
+        pal = load_customer_refs_from_pallet(_bust=_get_bust("pallet_detail"))
+        if pal is not None and not pal.empty:
+            tmp = pal.copy()
+            tmp["_pri"] = 2
+            frames.append(tmp)
+
+        # 3) 到仓
+        arr = load_customer_refs_from_arrivals(_bust=_get_bust("arrivals"))
+        if arr is not None and not arr.empty:
+            tmp = arr.copy()
+            tmp["_pri"] = 3
+            frames.append(tmp)
+
+        if not frames:
+            # 返回空骨架，避免后面 KeyError
+            return pd.DataFrame(columns=["运单号","客户单号","_pri"])
+
+        cust_all = pd.concat(frames, ignore_index=True)
+
+        # 统一 & 过滤
+        cust_all["运单号"] = cust_all["运单号"].map(_norm_waybill_str)
+        cust_all["客户单号"] = cust_all["客户单号"].astype(str).str.strip()
+        cust_all = cust_all[
+            cust_all["运单号"].isin(wb_from_track) & (cust_all["客户单号"] != "")
+        ]
+
+        # 兜底：万一上面哪里漏了 _pri
+        if "_pri" not in cust_all.columns:
+            cust_all["_pri"] = 99
+
+        # 稳定排序（同运单按优先级最小保留）
+        cust_all = (cust_all
+                    .sort_values(["运单号","_pri"], kind="mergesort")
+                    .drop_duplicates(subset=["运单号"], keep="first")
+                    )[["运单号","客户单号"]]
+
+        return cust_all
+
+    # —— 在你原位置调用 —— 
+    cust_all = _build_cust_priority_map(cust_override_map, bol, wb_from_track)
     if not cust_all.empty:
-        cust_all = cust_all[cust_all["运单号"].isin(wb_from_track)]
-        cust_all = cust_all[~cust_all["客户单号"].isna() & (cust_all["客户单号"].astype(str)!="")]
-        cust_all = (cust_all.sort_values(["运单号","_pri"])
-                            .drop_duplicates(subset=["运单号"], keep="first")[["运单号","客户单号"]])
         out = out.merge(cust_all, on="运单号", how="left")
     else:
         out["客户单号"] = pd.NA
+
 
     # BOL 自提字段
     if not bol.empty:
