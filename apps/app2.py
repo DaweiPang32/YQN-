@@ -41,18 +41,48 @@ if not st.session_state.get("_page_configured", False):
 _RE_PARENS = re.compile(r"[\(\（][\s\S]*?[\)\）]", re.DOTALL)
 _RE_SPLIT = re.compile(r"[,\，;\；、\|\/\s]+")
 _RE_NUM = re.compile(r'[-+]?\d+(?:\.\d+)?')
-# —— 仅在括号内且 IP 数量≥2 时，才把分隔符替换为空格 ——
-_IP_TOKEN   = re.compile(r"\bIP\d+\b", flags=re.IGNORECASE)      # 匹配 IP123456 这种
-_SEP_INNER  = re.compile(r"[,\，;\；\|/]+")                      # 需要替换的括号内分隔符
+# —— 仅用于判断/替换“括号内多 IP”的场景 ——
+_IP_TOKEN   = re.compile(r"\bIP\d+\b", flags=re.IGNORECASE)   # 形如 IP8825...
+_SEP_INNER  = re.compile(r"[,\，;\；\|/]+")                   # 可能出现的分隔符
+
+def _has_multi_ip_in_parens(text: str) -> bool:
+    """是否存在至少一对括号里包含 ≥2 个 IP token（半角/全角括号均可）"""
+    if _is_blank(text):
+        return False
+    s = str(text)
+
+    def _count_in_pair(open_ch, close_ch, src):
+        depth, buf, hits = 0, [], 0
+        for ch in src:
+            if ch == open_ch:
+                if depth == 0:
+                    buf = []
+                depth += 1
+            elif ch == close_ch and depth > 0:
+                depth -= 1
+                if depth == 0:
+                    inner = "".join(buf)
+                    if len(_IP_TOKEN.findall(inner)) >= 2:
+                        hits += 1
+                    buf = []
+            else:
+                if depth > 0:
+                    buf.append(ch)
+        return hits
+
+    return (_count_in_pair("(", ")", s) > 0) or (_count_in_pair("（", "）", s) > 0)
 
 def _normalize_ip_list_in_parens(text: str) -> str:
     """
-    仅当括号内出现 >=2 个“IPxxxx...” 时，才把括号内的分隔符统一为空格；
-    不改变括号外内容；兼容半角() 与全角（）
+    仅当【某对括号内】出现 ≥2 个 IPxxxx 时，才把这对括号内的分隔符统一为空格；
+    否则原样返回（不动中文/PO/单 IP 等）。
     """
     if _is_blank(text):
         return ""
     s = str(text)
+    # 快速判定：没有“多 IP”就直接返回，避免任何动刀
+    if not _has_multi_ip_in_parens(s):
+        return s
 
     def _do_for_pair(open_ch, close_ch, src):
         out, buf, depth = [], [], 0
@@ -65,6 +95,7 @@ def _normalize_ip_list_in_parens(text: str) -> str:
             elif ch == close_ch and depth > 0:
                 depth -= 1
                 inner = "".join(buf)
+                # 仅当这一对括号内 IP 数≥2 才替换分隔符
                 if len(_IP_TOKEN.findall(inner)) >= 2:
                     inner = _SEP_INNER.sub(" ", inner)
                     inner = re.sub(r"\s{2,}", " ", inner).strip()
@@ -2104,9 +2135,6 @@ with tab1:
 
             tmp[pid_col_to_use] = upload_df["托盘号"].astype(str).str.strip()
 
-            # ✅ 在补齐列 & reindex 之前做“括号内多 IP → 空格分隔”的规范化
-            if "运单清单" in tmp.columns:
-                tmp["运单清单"] = tmp["运单清单"].map(_normalize_ip_list_in_parens)
 
             for col in header_raw:
                 if col not in tmp.columns:
