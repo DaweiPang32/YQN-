@@ -41,6 +41,46 @@ if not st.session_state.get("_page_configured", False):
 _RE_PARENS = re.compile(r"[\(\（][\s\S]*?[\)\）]", re.DOTALL)
 _RE_SPLIT = re.compile(r"[,\，;\；、\|\/\s]+")
 _RE_NUM = re.compile(r'[-+]?\d+(?:\.\d+)?')
+# —— 仅在括号内且 IP 数量≥2 时，才把分隔符替换为空格 ——
+_IP_TOKEN   = re.compile(r"\bIP\d+\b", flags=re.IGNORECASE)      # 匹配 IP123456 这种
+_SEP_INNER  = re.compile(r"[,\，;\；\|/]+")                      # 需要替换的括号内分隔符
+
+def _normalize_ip_list_in_parens(text: str) -> str:
+    """
+    仅当括号内出现 >=2 个“IPxxxx...” 时，才把括号内的分隔符统一为空格；
+    不改变括号外内容；兼容半角() 与全角（）
+    """
+    if _is_blank(text):
+        return ""
+    s = str(text)
+
+    def _do_for_pair(open_ch, close_ch, src):
+        out, buf, depth = [], [], 0
+        for ch in src:
+            if ch == open_ch:
+                if depth == 0:
+                    buf = []
+                depth += 1
+                out.append(ch)
+            elif ch == close_ch and depth > 0:
+                depth -= 1
+                inner = "".join(buf)
+                if len(_IP_TOKEN.findall(inner)) >= 2:
+                    inner = _SEP_INNER.sub(" ", inner)
+                    inner = re.sub(r"\s{2,}", " ", inner).strip()
+                out.append(inner)
+                out.append(ch)
+                buf = []
+            else:
+                if depth > 0:
+                    buf.append(ch)
+                else:
+                    out.append(ch)
+        return "".join(out)
+
+    s = _do_for_pair("(", ")", s)
+    s = _do_for_pair("（", "）", s)
+    return s
 
 def _split_tokens(s: str) -> list[str]:
     """快速分词：按通用分隔符切分并剔除空白"""
@@ -122,7 +162,7 @@ def get_gspread_client():
 client, sheets_service = get_clients()
 # ========= 表名配置 =========
 SHEET_ARRIVALS_NAME   = "到仓数据表"       # ETD/ATD、ETA/ATA（合并）、对客承诺送仓时间、预计到仓时间（日）
-SHEET_PALLET_DETAIL   = "托盘明细表"       # 托盘数据（重量/体积来自此表；体积由 L/W/H(inch) 计算为 CBM）
+SHEET_PALLET_DETAIL   = "托盘明细表"    # 托盘数据（重量/体积来自此表；体积由 L/W/H(inch) 计算为 CBM）
 SHEET_SHIP_TRACKING   = "发货追踪"         # 托盘维度出仓记录（分摊到托盘）
 SHEET_BOL_DETAIL      = "bol自提明细"      # 到自提仓库 明细（分摊到运单）
 SHEET_WB_SUMMARY      = "运单全链路汇总"    # 仅部分更新
@@ -770,7 +810,9 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
         for wb in waybills:
             wb_norm = _norm_waybill_str(wb)
             cust = cust_map.get(wb_norm, "")
-            waybills_disp.append(f"{wb}({cust})" if cust else f"{wb}")
+            disp = f"{wb}({cust})" if cust else f"{wb}"
+            disp = _normalize_ip_list_in_parens(disp)  # ✅ 仅当括号内有多个 IP 时改为空格分隔
+            waybills_disp.append(disp)
 
         # 托盘创建日期/时间
         create_date_str, create_time_str = _split_dt_to_date_time_str(
@@ -1159,7 +1201,7 @@ def _extract_pure_waybills_and_po(mixed: str):
         return wb_list, cust_map
 
     # 按中文/英文逗号、分号、顿号、竖线、斜杠等切分为“每个片段”
-    segs = re.split(r"[,\，;\；、\|]+", str(mixed))
+    segs = re.split(r"[,\，;\；、\|/]+", str(mixed))
     for seg in segs:
         seg = seg.strip()
         if not seg:
@@ -1397,6 +1439,20 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
                 if (wb not in wb2_date) or (dt_obj < wb2_date[wb]):
                     wb2_date[wb] = dt_obj
 
+    # ===== 费用一致性检查（就在这里新加）=====
+    total_from_track = pd.to_numeric(track.get("分摊费用"), errors="coerce").fillna(0).sum()
+    total_to_waybill = sum(wb2_cost.values())
+    diff_total = round(total_from_track - total_to_waybill, 2)
+
+    # 在 Streamlit 控制台与页面同时提示（便于排查是哪一步丢了钱）
+    st.write(f"🧮 费用检查：发货追踪合计={total_from_track:.2f}，已分到运单={total_to_waybill:.2f}，差额={diff_total:.2f}")
+
+    # 可选：逐车次核对（若同一 TR 有多天或多批，也能看出来是哪一车丢的）
+    if "_trk_k" in track.columns:
+        by_truck = (track
+            .assign(_cost = pd.to_numeric(track["分摊费用"], errors="coerce").fillna(0))
+            .groupby("_trk_k")["_cost"].sum())
+        st.write("各卡车在『发货追踪』里的合计：", by_truck.to_dict())
     # === 输出骨架 ===
     out = pd.DataFrame({"运单号": sorted(wb_from_track)})
 
@@ -2048,6 +2104,10 @@ with tab1:
 
             tmp[pid_col_to_use] = upload_df["托盘号"].astype(str).str.strip()
 
+            # ✅ 在补齐列 & reindex 之前做“括号内多 IP → 空格分隔”的规范化
+            if "运单清单" in tmp.columns:
+                tmp["运单清单"] = tmp["运单清单"].map(_normalize_ip_list_in_parens)
+
             for col in header_raw:
                 if col not in tmp.columns:
                     tmp[col] = ""
@@ -2055,6 +2115,7 @@ with tab1:
 
             ws_track.append_rows(rows, value_input_option="USER_ENTERED")
             st.success(f"✅ 已上传 {len(rows)} 条到『{SHEET_SHIP_TRACKING}』。卡车单号：{pallet_truck_no}")
+
 
             _bust("ship_tracking")
             _ = load_ship_tracking_raw(_bust=_get_bust("ship_tracking"))
