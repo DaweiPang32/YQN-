@@ -2108,13 +2108,42 @@ with tab1:
             if "运单清单" in tmp.columns:
                 tmp["运单清单"] = tmp["运单清单"].map(_normalize_ip_list_in_parens)
 
+            # ✅ === 规范化“运单清单”列，仅括号内多 IP 时替换分隔符 ===
+            def _norm_hdr_key(s: str) -> str:
+                return str(s).replace("\u00A0"," ").replace("\n","").replace(" ","").strip().lower()
+            
+            # 目标表头可能叫这些名字之一（根据你自己的 header_raw）
+            _wb_list_header_aliases = {"运单清单","waybills","waybilllist","waybill_list","运单列表","运单号列表"}
+            
+            # 找目标表里实际列名
+            wb_list_target_col = None
+            for h in header_raw:
+                if _norm_hdr_key(h) in _wb_list_header_aliases:
+                    wb_list_target_col = h
+                    break
+            
+            if wb_list_target_col:
+                # 源列可能叫这些（根据你 tmp 的列）
+                src_candidates = ["运单清单","Waybills","WaybillList","Waybill_List","运单列表","运单号列表"]
+                wb_list_source_col = next((c for c in src_candidates if c in tmp.columns), None)
+            
+                if wb_list_source_col:
+                    # ✅ 调用我们写的 _normalize_ip_list_in_parens 函数，只改括号内多 IP
+                    tmp[wb_list_target_col] = tmp[wb_list_source_col].map(_normalize_ip_list_in_parens)
+                else:
+                    if wb_list_target_col not in tmp.columns:
+                        tmp[wb_list_target_col] = ""
+            
+            # ✅ === 下面保持你原来的逻辑 ===
             for col in header_raw:
                 if col not in tmp.columns:
                     tmp[col] = ""
+            
             rows = tmp.reindex(columns=header_raw).fillna("").values.tolist()
-
+            
             ws_track.append_rows(rows, value_input_option="USER_ENTERED")
             st.success(f"✅ 已上传 {len(rows)} 条到『{SHEET_SHIP_TRACKING}』。卡车单号：{pallet_truck_no}")
+
 
 
             _bust("ship_tracking")
