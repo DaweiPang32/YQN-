@@ -41,12 +41,100 @@ if not st.session_state.get("_page_configured", False):
 _RE_PARENS = re.compile(r"[\(\（][\s\S]*?[\)\）]", re.DOTALL)
 _RE_SPLIT = re.compile(r"[,\，;\；、\|\/\s]+")
 _RE_NUM = re.compile(r'[-+]?\d+(?:\.\d+)?')
+# —— 仅在括号内且 IP 数量≥2 时，才把分隔符替换为空格 ——
+_IP_TOKEN   = re.compile(r"\bIP\d+\b", flags=re.IGNORECASE)      # 匹配 IP123456 这种
+_SEP_INNER  = re.compile(r"[,\，;\；\|/]+")                      # 需要替换的括号内分隔符
+
+def _normalize_ip_list_in_parens(text: str) -> str:
+    """
+    仅当括号内出现 >=2 个“IPxxxx...” 时，才把括号内的分隔符统一为空格；
+    不改变括号外内容；兼容半角() 与全角（）
+    """
+    if _is_blank(text):
+        return ""
+    s = str(text)
+
+    def _do_for_pair(open_ch, close_ch, src):
+        out, buf, depth = [], [], 0
+        for ch in src:
+            if ch == open_ch:
+                if depth == 0:
+                    buf = []
+                depth += 1
+                out.append(ch)
+            elif ch == close_ch and depth > 0:
+                depth -= 1
+                inner = "".join(buf)
+                if len(_IP_TOKEN.findall(inner)) >= 2:
+                    inner = _SEP_INNER.sub(" ", inner)
+                    inner = re.sub(r"\s{2,}", " ", inner).strip()
+                out.append(inner)
+                out.append(ch)
+                buf = []
+            else:
+                if depth > 0:
+                    buf.append(ch)
+                else:
+                    out.append(ch)
+        return "".join(out)
+
+    s = _do_for_pair("(", ")", s)
+    s = _do_for_pair("（", "）", s)
+    return s
 
 def _split_tokens(s: str) -> list[str]:
     """快速分词：按通用分隔符切分并剔除空白"""
     if not isinstance(s, str):
         s = str(s) if s is not None else ""
     return [t for t in _RE_SPLIT.split(s) if t]
+def _remove_parens_iter(s: str) -> str:
+    """反复去掉半角/全角括号内的内容（支持嵌套），直到不能再去。"""
+    if not isinstance(s, str) or not s:
+        return ""
+    prev = None
+    out = s
+    while prev != out:
+        prev = out
+        # 先半角，再全角
+        out = re.sub(r"\([^()]*\)", "", out)
+        out = re.sub(r"（[^（）]*）", "", out)
+    return out
+
+def _first_balanced_paren_content(s: str) -> str | None:
+    """
+    返回字符串 s 中【第一个成对括号】内的完整内容（支持嵌套、支持全角/半角）。
+    优先匹配半角()；若未找到再尝试全角（）。
+    """
+    if not isinstance(s, str) or not s:
+        return None
+
+    # 半角
+    start = s.find("(")
+    if start != -1:
+        depth = 0
+        for i in range(start, len(s)):
+            ch = s[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return s[start+1:i].strip()
+
+    # 全角
+    start = s.find("（")
+    if start != -1:
+        depth = 0
+        for i in range(start, len(s)):
+            ch = s[i]
+            if ch == "（":
+                depth += 1
+            elif ch == "）":
+                depth -= 1
+                if depth == 0:
+                    return s[start+1:i].strip()
+    return None
+
 # ========= 客户端复用 =========
 @st.cache_resource
 def get_clients():
@@ -74,7 +162,7 @@ def get_gspread_client():
 client, sheets_service = get_clients()
 # ========= 表名配置 =========
 SHEET_ARRIVALS_NAME   = "到仓数据表"       # ETD/ATD、ETA/ATA（合并）、对客承诺送仓时间、预计到仓时间（日）
-SHEET_PALLET_DETAIL   = "托盘明细表"       # 托盘数据（重量/体积来自此表；体积由 L/W/H(inch) 计算为 CBM）
+SHEET_PALLET_DETAIL   = "托盘明细表"    # 托盘数据（重量/体积来自此表；体积由 L/W/H(inch) 计算为 CBM）
 SHEET_SHIP_TRACKING   = "发货追踪"         # 托盘维度出仓记录（分摊到托盘）
 SHEET_BOL_DETAIL      = "bol自提明细"      # 到自提仓库 明细（分摊到运单）
 SHEET_WB_SUMMARY      = "运单全链路汇总"    # 仅部分更新
@@ -722,7 +810,9 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
         for wb in waybills:
             wb_norm = _norm_waybill_str(wb)
             cust = cust_map.get(wb_norm, "")
-            waybills_disp.append(f"{wb}({cust})" if cust else f"{wb}")
+            disp = f"{wb}({cust})" if cust else f"{wb}"
+            disp = _normalize_ip_list_in_parens(disp)  # ✅ 仅当括号内有多个 IP 时改为空格分隔
+            waybills_disp.append(disp)
 
         # 托盘创建日期/时间
         create_date_str, create_time_str = _split_dt_to_date_time_str(
@@ -1098,6 +1188,56 @@ def load_customer_refs_from_pallet(_bust=0):
     return out[["运单号","客户单号"]]
 
 # ===================== 运单增量构建 =====================
+def _extract_pure_waybills_and_po(mixed: str):
+    """
+    输入整段“运单清单”cell，返回 (wb_list, cust_map_from_cell)
+      - wb_list: 解析出的运单号列表（括号去掉后再判定，避免跨段）
+      - cust_map_from_cell: {wb: 第一个括号的原样内容}
+        * 注意：不判断是不是 PO；只要在该段的第一个括号里，就原样写
+    """
+    wb_list = []
+    cust_map = {}
+    if _is_blank(mixed):
+        return wb_list, cust_map
+
+    # 按中文/英文逗号、分号、顿号、竖线、斜杠等切分为“每个片段”
+    segs = re.split(r"[,\，;\；、\|/]+", str(mixed))
+    for seg in segs:
+        seg = seg.strip()
+        if not seg:
+            continue
+
+        # 1) 取第一个括号的完整内容（支持嵌套；半角优先、再全角）
+        first_paren_text = _first_balanced_paren_content(seg)
+
+        # 2) 为了找 WB：把括号内容迭代删除，再做 token 判定
+        seg_no_paren = _remove_parens_iter(seg)
+        parts = _split_tokens(seg_no_paren)
+
+        found_wb_for_this_seg = None
+        for p in parts:
+            token = _norm_waybill_str(p)
+            if not token:
+                continue
+            # 排除以 IP 开头
+            if token.upper().startswith("IP"):
+                continue
+            # 必须字母+数字且长度>=8
+            if not (re.search(r"[A-Za-z]", token) and re.search(r"\d", token) and len(token) >= 8):
+                continue
+            wb_list.append(token)
+            # 把“该段的第一个 WB”和“该段的第一个括号文本”关联起来
+            if first_paren_text and (found_wb_for_this_seg is None):
+                cust_map[token] = first_paren_text
+                found_wb_for_this_seg = token
+
+    # 去重保序
+    seen = set(); out = []
+    for wb in wb_list:
+        if wb not in seen:
+            seen.add(wb); out.append(wb)
+    return out, cust_map
+
 def _extract_pure_waybills(mixed: str) -> list[str]:
     """
     从《发货追踪》的“运单清单”字段中提取纯运单号列表。
@@ -1165,7 +1305,6 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
         ])
 
     # === 强标准化 + 去重（托盘/卡车/日期） ===
-    # === 强标准化 + 去重（托盘/卡车/日期） ===
     def _norm_pid(s):
         return str(s).strip().upper() if pd.notna(s) else ""
     def _norm_trk(s):
@@ -1199,10 +1338,21 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
 
 
     # === 仅解析一次“运单清单”为列表 ===
-    def _wb_list_from_row(s):
-        # 兼容已清洗的 override（可能已是干净的字符串）
-        return _extract_pure_waybills(s)
-    track["_wb_list"] = track.get("运单清单","").map(_wb_list_from_row)
+    # === 同时解析“运单清单列表”与“第一个括号→客户单号覆盖表” ===
+    track = track.copy()
+    wb_lists = []
+    cust_override_map = {}  # {wb: 来自该段第一个括号的文本}
+
+    for _, r in track.iterrows():
+        wb_list, cell_map = _extract_pure_waybills_and_po(r.get("运单清单",""))
+        wb_lists.append(wb_list)
+        for k, v in (cell_map or {}).items():
+            if k and v:
+                cust_override_map[k] = v
+
+    track["_wb_list"] = wb_lists
+
+
 
     # === 汇总出本次涉及的运单集合 ===
     wb_from_track = set()
@@ -1289,6 +1439,20 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
                 if (wb not in wb2_date) or (dt_obj < wb2_date[wb]):
                     wb2_date[wb] = dt_obj
 
+    # ===== 费用一致性检查（就在这里新加）=====
+    total_from_track = pd.to_numeric(track.get("分摊费用"), errors="coerce").fillna(0).sum()
+    total_to_waybill = sum(wb2_cost.values())
+    diff_total = round(total_from_track - total_to_waybill, 2)
+
+    # 在 Streamlit 控制台与页面同时提示（便于排查是哪一步丢了钱）
+    st.write(f"🧮 费用检查：发货追踪合计={total_from_track:.2f}，已分到运单={total_to_waybill:.2f}，差额={diff_total:.2f}")
+
+    # 可选：逐车次核对（若同一 TR 有多天或多批，也能看出来是哪一车丢的）
+    if "_trk_k" in track.columns:
+        by_truck = (track
+            .assign(_cost = pd.to_numeric(track["分摊费用"], errors="coerce").fillna(0))
+            .groupby("_trk_k")["_cost"].sum())
+        st.write("各卡车在『发货追踪』里的合计：", by_truck.to_dict())
     # === 输出骨架 ===
     out = pd.DataFrame({"运单号": sorted(wb_from_track)})
 
@@ -1312,27 +1476,76 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
         out["到港(ETA/ATA)"] = pd.NA
         out["到仓日期"]       = pd.NA
 
-    # 客户单号优先级：BOL(1) > 托盘(2) > 到仓(3)
-    cust_bol = bol[["运单号","客户单号"]] if (not bol.empty and "客户单号" in bol.columns) \
-               else pd.DataFrame(columns=["运单号","客户单号"])
-    cust_pal = load_customer_refs_from_pallet(_bust=_get_bust("pallet_detail"))
-    cust_arr = load_customer_refs_from_arrivals(_bust=_get_bust("arrivals"))
-    for d in (cust_pal, cust_arr):
-        if not d.empty:
-            d.drop_duplicates(subset=["运单号"], inplace=True)
-            d["运单号"] = d["运单号"].map(_norm_waybill_str)
-    cust_all = pd.concat(
-        [cust_bol.assign(_pri=1), cust_pal.assign(_pri=2), cust_arr.assign(_pri=3)],
-        ignore_index=True
-    )
+    # ==== 客户单号优先级：cell括号(0) > BOL(1) > 托盘(2) > 到仓(3) ====
+
+    def _build_cust_priority_map(cust_override_map: dict,
+                                bol_df: pd.DataFrame,
+                                wb_from_track: set[str]) -> pd.DataFrame:
+        frames = []
+
+        # 0) 来自“运单清单 cell 第一个括号”的覆盖
+        if cust_override_map:
+            cust_from_cell = pd.DataFrame(
+                [{"运单号": wb, "客户单号": po}
+                for wb, po in cust_override_map.items()
+                if po is not None and str(po).strip() != ""]
+            )
+            if not cust_from_cell.empty:
+                cust_from_cell["_pri"] = 0
+                frames.append(cust_from_cell)
+
+        # 1) BOL
+        if bol_df is not None and not bol_df.empty and "客户单号" in bol_df.columns:
+            tmp = bol_df[["运单号","客户单号"]].copy()
+            tmp["_pri"] = 1
+            frames.append(tmp)
+
+        # 2) 托盘
+        pal = load_customer_refs_from_pallet(_bust=_get_bust("pallet_detail"))
+        if pal is not None and not pal.empty:
+            tmp = pal.copy()
+            tmp["_pri"] = 2
+            frames.append(tmp)
+
+        # 3) 到仓
+        arr = load_customer_refs_from_arrivals(_bust=_get_bust("arrivals"))
+        if arr is not None and not arr.empty:
+            tmp = arr.copy()
+            tmp["_pri"] = 3
+            frames.append(tmp)
+
+        if not frames:
+            # 返回空骨架，避免后面 KeyError
+            return pd.DataFrame(columns=["运单号","客户单号","_pri"])
+
+        cust_all = pd.concat(frames, ignore_index=True)
+
+        # 统一 & 过滤
+        cust_all["运单号"] = cust_all["运单号"].map(_norm_waybill_str)
+        cust_all["客户单号"] = cust_all["客户单号"].astype(str).str.strip()
+        cust_all = cust_all[
+            cust_all["运单号"].isin(wb_from_track) & (cust_all["客户单号"] != "")
+        ]
+
+        # 兜底：万一上面哪里漏了 _pri
+        if "_pri" not in cust_all.columns:
+            cust_all["_pri"] = 99
+
+        # 稳定排序（同运单按优先级最小保留）
+        cust_all = (cust_all
+                    .sort_values(["运单号","_pri"], kind="mergesort")
+                    .drop_duplicates(subset=["运单号"], keep="first")
+                    )[["运单号","客户单号"]]
+
+        return cust_all
+
+    # —— 在你原位置调用 —— 
+    cust_all = _build_cust_priority_map(cust_override_map, bol, wb_from_track)
     if not cust_all.empty:
-        cust_all = cust_all[cust_all["运单号"].isin(wb_from_track)]
-        cust_all = cust_all[~cust_all["客户单号"].isna() & (cust_all["客户单号"].astype(str)!="")]
-        cust_all = (cust_all.sort_values(["运单号","_pri"])
-                            .drop_duplicates(subset=["运单号"], keep="first")[["运单号","客户单号"]])
         out = out.merge(cust_all, on="运单号", how="left")
     else:
         out["客户单号"] = pd.NA
+
 
     # BOL 自提字段
     if not bol.empty:
@@ -1891,6 +2104,10 @@ with tab1:
 
             tmp[pid_col_to_use] = upload_df["托盘号"].astype(str).str.strip()
 
+            # ✅ 在补齐列 & reindex 之前做“括号内多 IP → 空格分隔”的规范化
+            if "运单清单" in tmp.columns:
+                tmp["运单清单"] = tmp["运单清单"].map(_normalize_ip_list_in_parens)
+
             for col in header_raw:
                 if col not in tmp.columns:
                     tmp[col] = ""
@@ -1898,6 +2115,7 @@ with tab1:
 
             ws_track.append_rows(rows, value_input_option="USER_ENTERED")
             st.success(f"✅ 已上传 {len(rows)} 条到『{SHEET_SHIP_TRACKING}』。卡车单号：{pallet_truck_no}")
+
 
             _bust("ship_tracking")
             _ = load_ship_tracking_raw(_bust=_get_bust("ship_tracking"))
