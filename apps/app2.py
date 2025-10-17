@@ -1,14 +1,4 @@
-# 功能：
-# - 托盘重量/体积：重量只来自《托盘明细表》并按托盘求和；体积由长宽高（inch）计算为 CBM（每个托盘只计算一次，避免重复）
-# - ETA/ATA（合并列）、ETD/ATD（Excel序列 45824 等）→ 日期字符串
-# - 对客承诺送仓时间如“19-21”→ 与今天的天数差：x-y（锚定 ETA/ATA 的月份，缺失用当月）
-# - 已发托盘读取自『发货追踪』，再次进入页面自动隐藏
-# - 上传到『发货追踪』后，自动【部分更新】『运单全链路汇总』
-#   仅更新以下列：客户单号、发出(ETD/ATD)、到港(ETA/ATA)、到自提仓库日期、到自提仓库卡车号、到自提仓库费用、发走日期、发走卡车号、发走费用
-# - 只针对『发货追踪』里出现过的运单号进行汇总/更新
-# - 兼容『bol自提明细』/『发货追踪』实际列名（卡车号/费用/日期/客户单号等）
-# - 新增：在托盘展示中显示《托盘明细表》提交时写入的【托盘创建日期 / 托盘创建时间】
-# - 防 429：退避重试 + 局部缓存 bust（不清全站）
+# 🚚 发货调度（严格 USSH 运单号 + 客户单号仅来自『到仓数据表』）
 
 import streamlit as st
 import pandas as pd
@@ -32,25 +22,35 @@ if not st.session_state.get("_page_configured", False):
     try:
         st.set_page_config(page_title="发货调度", layout="wide")
     except StreamlitAPIException:
-        # 已有其它页面/模块设置过，忽略重复设置
         pass
     st.session_state["_page_configured"] = True
-# ==============================================
 
 # ========= 预编译正则 =========
 _RE_PARENS = re.compile(r"[\(\（][\s\S]*?[\)\）]", re.DOTALL)
 _RE_SPLIT = re.compile(r"[,\，;\；、\|\/\s]+")
 _RE_NUM = re.compile(r'[-+]?\d+(?:\.\d+)?')
-# —— 仅用于判断/替换“括号内多 IP”的场景 ——
-_IP_TOKEN   = re.compile(r"\bIP\d+\b", flags=re.IGNORECASE)   # 形如 IP8825...
-_SEP_INNER  = re.compile(r"[,\，;\；\|/]+")                   # 可能出现的分隔符
+_IP_TOKEN   = re.compile(r"\bIP\d+\b", flags=re.IGNORECASE)
+_SEP_INNER  = re.compile(r"[,\，;\；\|/]+")
+# ✅ 严格只认 USSH + 12 位数字（大小写不敏感）
+_WB_USSH_REGEX = re.compile(r"\bUSSH\d{12}\b", flags=re.IGNORECASE)
+
+def _extract_wb_ushh_only(mixed: str) -> list[str]:
+    """仅识别 USSH + 12位数字为运单号；统一输出为大写去重保序。"""
+    if _is_blank(mixed):
+        return []
+    hits = _WB_USSH_REGEX.findall(str(mixed))
+    out, seen = [], set()
+    for t in hits:
+        t_norm = t.upper()
+        if t_norm not in seen:
+            seen.add(t_norm)
+            out.append(t_norm)
+    return out
 
 def _has_multi_ip_in_parens(text: str) -> bool:
-    """是否存在至少一对括号里包含 ≥2 个 IP token（半角/全角括号均可）"""
     if _is_blank(text):
         return False
     s = str(text)
-
     def _count_in_pair(open_ch, close_ch, src):
         depth, buf, hits = 0, [], 0
         for ch in src:
@@ -69,21 +69,15 @@ def _has_multi_ip_in_parens(text: str) -> bool:
                 if depth > 0:
                     buf.append(ch)
         return hits
-
     return (_count_in_pair("(", ")", s) > 0) or (_count_in_pair("（", "）", s) > 0)
 
 def _normalize_ip_list_in_parens(text: str) -> str:
-    """
-    仅当【某对括号内】出现 ≥2 个 IPxxxx 时，才把这对括号内的分隔符统一为空格；
-    否则原样返回（不动中文/PO/单 IP 等）。
-    """
+    """仅当括号里出现 ≥2 个 IPxxxx 时，将分隔符统一为空格；否则保持原样。"""
     if _is_blank(text):
         return ""
     s = str(text)
-    # 快速判定：没有“多 IP”就直接返回，避免任何动刀
     if not _has_multi_ip_in_parens(s):
         return s
-
     def _do_for_pair(open_ch, close_ch, src):
         out, buf, depth = [], [], 0
         for ch in src:
@@ -95,7 +89,6 @@ def _normalize_ip_list_in_parens(text: str) -> str:
             elif ch == close_ch and depth > 0:
                 depth -= 1
                 inner = "".join(buf)
-                # 仅当这一对括号内 IP 数≥2 才替换分隔符
                 if len(_IP_TOKEN.findall(inner)) >= 2:
                     inner = _SEP_INNER.sub(" ", inner)
                     inner = re.sub(r"\s{2,}", " ", inner).strip()
@@ -108,38 +101,29 @@ def _normalize_ip_list_in_parens(text: str) -> str:
                 else:
                     out.append(ch)
         return "".join(out)
-
     s = _do_for_pair("(", ")", s)
     s = _do_for_pair("（", "）", s)
     return s
 
 def _split_tokens(s: str) -> list[str]:
-    """快速分词：按通用分隔符切分并剔除空白"""
     if not isinstance(s, str):
         s = str(s) if s is not None else ""
     return [t for t in _RE_SPLIT.split(s) if t]
+
 def _remove_parens_iter(s: str) -> str:
-    """反复去掉半角/全角括号内的内容（支持嵌套），直到不能再去。"""
     if not isinstance(s, str) or not s:
         return ""
     prev = None
     out = s
     while prev != out:
         prev = out
-        # 先半角，再全角
         out = re.sub(r"\([^()]*\)", "", out)
         out = re.sub(r"（[^（）]*）", "", out)
     return out
 
 def _first_balanced_paren_content(s: str) -> str | None:
-    """
-    返回字符串 s 中【第一个成对括号】内的完整内容（支持嵌套、支持全角/半角）。
-    优先匹配半角()；若未找到再尝试全角（）。
-    """
     if not isinstance(s, str) or not s:
         return None
-
-    # 半角
     start = s.find("(")
     if start != -1:
         depth = 0
@@ -151,8 +135,6 @@ def _first_balanced_paren_content(s: str) -> str | None:
                 depth -= 1
                 if depth == 0:
                     return s[start+1:i].strip()
-
-    # 全角
     start = s.find("（")
     if start != -1:
         depth = 0
@@ -169,34 +151,27 @@ def _first_balanced_paren_content(s: str) -> str | None:
 # ========= 客户端复用 =========
 @st.cache_resource
 def get_clients():
-    """
-    返回 (gspread_client, sheets_service)
-    - gspread_client: 兼容你现有的所有 ws 读取/写入
-    - sheets_service: 官方 Sheets v4 Service，用于 batchUpdate 等高效写
-    """
     if "gcp_service_account" in st.secrets:
         sa_info = st.secrets["gcp_service_account"]
         creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
     else:
         creds = Credentials.from_service_account_file("service_accounts.json", scopes=SCOPES)
-
     gc = gspread.authorize(creds)
-    # cache_discovery=False 可避免不必要的网络请求
     svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
     return gc, svc
 
 def get_gspread_client():
-    # 兼容旧调用：内部改为复用统一 Clients
     gc, _ = get_clients()
     return gc
 
 client, sheets_service = get_clients()
+
 # ========= 表名配置 =========
-SHEET_ARRIVALS_NAME   = "到仓数据表"       # ETD/ATD、ETA/ATA（合并）、对客承诺送仓时间、预计到仓时间（日）
-SHEET_PALLET_DETAIL   = "托盘明细表"    # 托盘数据（重量/体积来自此表；体积由 L/W/H(inch) 计算为 CBM）
-SHEET_SHIP_TRACKING   = "发货追踪"         # 托盘维度出仓记录（分摊到托盘）
-SHEET_BOL_DETAIL      = "bol自提明细"      # 到自提仓库 明细（分摊到运单）
-SHEET_WB_SUMMARY      = "运单全链路汇总"    # 仅部分更新
+SHEET_ARRIVALS_NAME   = "到仓数据表"
+SHEET_PALLET_DETAIL   = "托盘明细表"
+SHEET_SHIP_TRACKING   = "发货追踪"
+SHEET_BOL_DETAIL      = "bol自提明细"
+SHEET_WB_SUMMARY      = "运单全链路汇总"
 
 # ========= 通用工具 =========
 def _norm_header(cols):
@@ -225,18 +200,9 @@ def _is_blank(v):
         except Exception: return False
 
 def _pack_ranges_for_col(ws_title: str, col_idx_1based: int, rowvals: list[tuple[int, list]]):
-    """
-    将同一列的 (行号, [单元格值]) 列表压成若干个连续 A1 区段，返回 Sheets batchUpdate 需要的 dict 列表。
-    - ws_title: 工作表名（如 'Sheet1'）
-    - col_idx_1based: 列号（1 起）
-    - rowvals: [(row_index, [value]), ...]，必须已按 row_index 升序
-    返回: [{"range": "Sheet1!B2:B10", "values": [[...],[...],...]} , ...]
-    """
     updates = []
     if not rowvals:
         return updates
-
-    # 合并连续行
     s = p = rowvals[0][0]
     buf = [rowvals[0][1]]
     for r, v in rowvals[1:]:
@@ -249,16 +215,14 @@ def _pack_ranges_for_col(ws_title: str, col_idx_1based: int, rowvals: list[tuple
             updates.append({"range": f"{ws_title}!{a1s}:{a1e}", "values": buf})
             s = p = r
             buf = [v]
-    # 尾段
     a1s = gspread.utils.rowcol_to_a1(s, col_idx_1based)
     a1e = gspread.utils.rowcol_to_a1(p, col_idx_1based)
     updates.append({"range": f"{ws_title}!{a1s}:{a1e}", "values": buf})
     return updates
 
-# ==== 退避重试的 get_all_values（遇 429 自动重试）====
+# ==== 退避重试读取 ====
 def _safe_get_all_values(ws, value_render_option="UNFORMATTED_VALUE", date_time_render_option="SERIAL_NUMBER"):
-    """对 get_all_values 做 429 退避重试，平滑瞬时读峰值。"""
-    backoffs = [0.5, 1.0, 2.0, 4.0, 8.0]  # 最多 5 次，合计 ~15s
+    backoffs = [0.5, 1.0, 2.0, 4.0, 8.0]
     for i, delay in enumerate([0.0] + backoffs):
         if delay:
             time.sleep(delay + random.random()*0.2)
@@ -273,12 +237,8 @@ def _safe_get_all_values(ws, value_render_option="UNFORMATTED_VALUE", date_time_
                 if i < len(backoffs):
                     continue
             raise
-# ==== 轻量 HTTP 退避调用（用于 Sheets API 原生调用）====
+
 def _with_backoff(fn, *args, **kwargs):
-    """
-    对 Google API 调用做最多 6 次指数退避（~0.3 + 0.6 + 1.2 + 2.4 + 4.8 + 6.0s）。
-    用于 values.get / values.batchGet / spreadsheets.get 等。
-    """
     delays = [0.3, 0.6, 1.2, 2.4, 4.8, 6.0]
     last_err = None
     for i, d in enumerate([0.0] + delays):
@@ -287,17 +247,14 @@ def _with_backoff(fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
-            # 只对 429/配额 做重试，其它错误抛出
             msg = str(e)
             if ("429" in msg) or ("Quota" in msg) or ("quota" in msg):
                 last_err = e
                 continue
             raise
-    # 到这里说明重试已用尽
     if last_err:
         raise last_err
 
-# ==== 轻量 bust：只刷新相关缓存，不清全站 ====
 def _bust(name: str):
     key = f"_bust_{name}"
     st.session_state[key] = int(st.session_state.get(key, 0)) + 1
@@ -316,14 +273,9 @@ def _norm_waybill_str(v):
     except: pass
     return s
 
-# Excel/GS 序列起点
 _BASE = datetime(1899, 12, 30)
 
 def _coerce_excel_serial_sum(v):
-    """
-    将 v 合并为 Excel/GS 序列天数（可含小数）。
-    兼容多格式，解析失败返回 None
-    """
     try:
         if isinstance(v, (int, float)) and not pd.isna(v):
             return float(v)
@@ -333,15 +285,13 @@ def _coerce_excel_serial_sum(v):
         s = v.strip()
         s = re.sub(r'[\u00A0\u2000-\u200B]', ' ', s)
         s = s.replace(',', '.')
-        nums = _RE_NUM.findall(s)   # 使用预编译的数字正则
+        nums = _RE_NUM.findall(s)
         total, ok = 0.0, False
         for n in nums:
             try:
                 total += float(n); ok = True
-            except Exception:
-                pass
+            except Exception: pass
         if ok: return total
-
     if isinstance(v, (list, tuple)):
         total, ok = 0.0, False
         for x in v:
@@ -350,13 +300,11 @@ def _coerce_excel_serial_sum(v):
             try:
                 xs = str(x).strip().replace(',', '.')
                 total += float(xs); ok = True
-            except Exception:
-                pass
+            except Exception: pass
         if ok: return total
     return None
 
 def _parse_sheet_value_to_date(v):
-    """更安全的值->date 解析：优先看起来像日期的字符串，否则按序列数解析。"""
     if _is_blank(v): return None
     if isinstance(v, str):
         s = v.strip()
@@ -368,8 +316,7 @@ def _parse_sheet_value_to_date(v):
         try:
             dt = _BASE + timedelta(days=float(serial))
             return dt.date()
-        except Exception:
-            pass
+        except Exception: pass
     try:
         dt = pd.to_datetime(v, errors="coerce")
         if pd.isna(dt): return None
@@ -378,7 +325,6 @@ def _parse_sheet_value_to_date(v):
         return None
 
 def _excel_serial_to_dt(v):
-    """将任意形态的 Excel/GS 序列数或日期/时间字符串转为 datetime。"""
     if _is_blank(v): return None
     if isinstance(v, str):
         s = v.strip()
@@ -389,8 +335,7 @@ def _excel_serial_to_dt(v):
     if serial is not None:
         try:
             return _BASE + timedelta(days=float(serial))
-        except Exception:
-            pass
+        except Exception: pass
     try:
         ts = pd.to_datetime(v, errors="coerce")
         if pd.isna(ts): return None
@@ -461,73 +406,46 @@ def _first_nonblank_str(s):
             return str(x).strip()
     return ""
 
-# ========= 数据读取 =========
+# ========= 轻量签名 =========
 @st.cache_data(ttl=10)
 def _sheet_row_sig(sheet_name: str, _bust=0) -> tuple[int, int]:
-    """
-    返回 (rows, cols) 作为工作表的“轻量签名”：
-    - rows: 当前表的总行数
-    - cols: 当前表中最长一行的列数
-    作用：参与下游缓存 key，确保【改表头/新增列】也会触发相关缓存失效。
-    """
     try:
         ws = client.open(sheet_name).sheet1
     except SpreadsheetNotFound:
         return (0, 0)
-
-    vals = _safe_get_all_values(
-        ws,
-        value_render_option="UNFORMATTED_VALUE",
-        date_time_render_option="SERIAL_NUMBER"
-    )
+    vals = _safe_get_all_values(ws, "UNFORMATTED_VALUE", "SERIAL_NUMBER")
     if not vals:
         return (0, 0)
-
     rows = len(vals)
-    # 计算当前表中“最长一行”的列数，捕获只改列数时的变化
     cols = max((len(r) for r in vals), default=0)
     return (rows, cols)
 
-
 @st.cache_data(ttl=300)
 def load_bol_pickup_map(_bust=0) -> dict:
-    """从『bol自提明细test』构建 运单号→自提仓库 的映射。"""
     try:
         ws = client.open(SHEET_BOL_DETAIL).sheet1
     except SpreadsheetNotFound:
         return {}
-    vals = _safe_get_all_values(
-        ws,
-        value_render_option="UNFORMATTED_VALUE",
-        date_time_render_option="SERIAL_NUMBER"
-    )
+    vals = _safe_get_all_values(ws, "UNFORMATTED_VALUE", "SERIAL_NUMBER")
     if not vals:
         return {}
-
     header = _norm_header(vals[0])
     df = pd.DataFrame(vals[1:], columns=header) if len(vals) > 1 else pd.DataFrame(columns=header)
-
     col_wb = next((c for c in ["运单号","waybill","Waybill"] if c in df.columns), None)
     col_pk = next((c for c in ["自提仓库","自提仓","pickup","Pickup"] if c in df.columns), None)
     if not col_wb or not col_pk:
         return {}
-
     df[col_wb] = df[col_wb].apply(_norm_waybill_str)
     df[col_pk] = df[col_pk].astype(str).str.strip()
     df = df[(df[col_wb] != "") & (df[col_pk] != "")]
     df = df.drop_duplicates(subset=[col_wb], keep="last")
-
-    mapping = dict(zip(df[col_wb], df[col_pk]))
-    return mapping
+    return dict(zip(df[col_wb], df[col_pk]))
 
 @st.cache_data(ttl=30)
 def load_arrivals_df(_bust=0) -> pd.DataFrame:
     """
-    读取『到仓数据表』，只保留下游用到的列，并统一 dtype。
-    返回列（全部可用）：
-      运单号、仓库代码、收费重、体积、
-      ETA/ATA、ETD/ATD、对客承诺送仓时间、预计到仓时间（日）、
-      _ETAATA_date（date对象转成字符串前的锚点，用于送仓时段差值计算）
+    输出列：
+      运单号、仓库代码、收费重、体积、ETA/ATA、ETD/ATD、对客承诺送仓时间、预计到仓时间（日）、客户单号、_ETAATA_date
     """
     try:
         ws = client.open(SHEET_ARRIVALS_NAME).sheet1
@@ -535,37 +453,28 @@ def load_arrivals_df(_bust=0) -> pd.DataFrame:
         return pd.DataFrame(columns=[
             "运单号","仓库代码","收费重","体积",
             "ETA/ATA","ETD/ATD","对客承诺送仓时间","预计到仓时间（日）",
-            "_ETAATA_date"
+            "客户单号","_ETAATA_date"
         ])
-
-    vals = _safe_get_all_values(
-        ws,
-        value_render_option="UNFORMATTED_VALUE",
-        date_time_render_option="SERIAL_NUMBER"
-    )
+    vals = _safe_get_all_values(ws, "UNFORMATTED_VALUE", "SERIAL_NUMBER")
     if not vals or not vals[0]:
         return pd.DataFrame(columns=[
             "运单号","仓库代码","收费重","体积",
             "ETA/ATA","ETD/ATD","对客承诺送仓时间","预计到仓时间（日）",
-            "_ETAATA_date"
+            "客户单号","_ETAATA_date"
         ])
-
     header = _norm_header(vals[0])
     df = pd.DataFrame(vals[1:], columns=header)
 
-    # 别名/存在性处理
     if "运单号" not in df.columns: df["运单号"] = pd.NA
     if "仓库代码" not in df.columns: df["仓库代码"] = pd.NA
     if "收费重" not in df.columns: df["收费重"] = pd.NA
 
-    # 体积列自适配
     vol_col = next((c for c in ["体积","CBM","体积m3","体积(m3)","体积（m3）"] if c in df.columns), None)
     if vol_col is None:
         df["体积"] = pd.NA
     else:
         df["体积"] = pd.to_numeric(df[vol_col], errors="coerce")
 
-    # ETA/ATA 来源（可能是“ETA/ATA”或合并列“ETAATA”）
     etaata_src = None
     for cand in ["ETA/ATA","ETAATA"]:
         if cand in df.columns:
@@ -579,12 +488,15 @@ def load_arrivals_df(_bust=0) -> pd.DataFrame:
         df["预计到仓时间（日）"] = pd.NA
         eta_wh_col = "预计到仓时间（日）"
 
+    # ✅ 确保客户单号列存在
+    if "客户单号" not in df.columns:
+        df["客户单号"] = pd.NA
+
     # 规范化
     df["运单号"] = df["运单号"].apply(_norm_waybill_str)
     df["仓库代码"] = df["仓库代码"].astype(str).str.strip()
     df["收费重"] = pd.to_numeric(df["收费重"], errors="coerce")
 
-    # 解析日期：ETA/ATA 锚点 + 格式化
     if etaata_src is not None:
         df["_ETAATA_date"] = df[etaata_src].apply(_parse_sheet_value_to_date)
         df["ETA/ATA"] = df["_ETAATA_date"].apply(_fmt_date).replace("", pd.NA)
@@ -592,27 +504,22 @@ def load_arrivals_df(_bust=0) -> pd.DataFrame:
         df["_ETAATA_date"] = pd.NA
         df["ETA/ATA"] = pd.NA
 
-    # ETD/ATD 格式化
     df["_ETD_ATD_date"] = df["ETD/ATD"].apply(_parse_sheet_value_to_date)
     df["ETD/ATD"] = df["_ETD_ATD_date"].apply(_fmt_date).replace("", pd.NA)
 
-    # 预计到仓时间（日）格式化
     df["_ETA_WH_date"] = df[eta_wh_col].apply(_parse_sheet_value_to_date)
     df["预计到仓时间（日）"] = df["_ETA_WH_date"].apply(_fmt_date).replace("", pd.NA)
 
-    # 去重（同运单保留最后一条）
     df = df.drop_duplicates(subset=["运单号"], keep="last")
 
     keep = ["仓库代码","运单号","收费重","体积",
             "ETA/ATA","ETD/ATD","对客承诺送仓时间","预计到仓时间（日）",
+            "客户单号",
             "_ETAATA_date"]
     for c in keep:
         if c not in df.columns:
             df[c] = pd.NA
     return df[keep]
-
-
-
 
 @st.cache_data(ttl=300)
 def load_waybill_summary_df(_bust=0):
@@ -621,15 +528,10 @@ def load_waybill_summary_df(_bust=0):
     except SpreadsheetNotFound:
         st.error(f"找不到工作表「{SHEET_WB_SUMMARY}」。")
         return pd.DataFrame(), None, []
-    vals = _safe_get_all_values(
-        ws,
-        value_render_option="UNFORMATTED_VALUE",
-        date_time_render_option="SERIAL_NUMBER"
-    )
+    vals = _safe_get_all_values(ws, "UNFORMATTED_VALUE", "SERIAL_NUMBER")
     if not vals:
         st.warning("『运单全链路汇总』为空。")
         return pd.DataFrame(), ws, []
-
     header_raw = vals[0]
     df = pd.DataFrame(vals[1:], columns=header_raw) if len(vals) > 1 else pd.DataFrame(columns=header_raw)
 
@@ -668,35 +570,19 @@ def load_waybill_summary_df(_bust=0):
 
     return df_work, ws, header_raw
 
-# ====== 补丁D: 增加 refresh_token 参与 cache key，确保刷新后聚合重算 ======
 @st.cache_data(ttl=300)
 def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
                           bol_cost_df: pd.DataFrame | None = None,
                           _bust=0,
                           refresh_token: int = 0) -> pd.DataFrame:
-    """
-    托盘维度：从《托盘明细表》聚合，并与《到仓数据表》匹配时间/承诺字段；
-    同时引入『bol自提明细test』中的“自提仓库”映射，生成：
-      - 自提仓库(按托盘)：若托盘内所有运单对应同一自提仓库则取该值；否则为“（多自提仓）”；若都无映射则空
-      - 自提仓库(按运单)：逐单展示，形如 "WB1(A仓), WB2(B仓), ..."
-    返回托盘粒度 DataFrame。
-    注：refresh_token 仅参与缓存 key，无需在函数体内使用。
-    """
-    # === 读托盘明细 ===
     ws = client.open(SHEET_PALLET_DETAIL).sheet1
-    vals = _safe_get_all_values(
-        ws,
-        value_render_option="UNFORMATTED_VALUE",
-        date_time_render_option="SERIAL_NUMBER"
-    )
+    vals = _safe_get_all_values(ws, "UNFORMATTED_VALUE", "SERIAL_NUMBER")
     if not vals:
         return pd.DataFrame()
 
     header = _norm_header(vals[0])
     df = pd.DataFrame(vals[1:], columns=header)
 
-    # --- 关键列统一 ---
-    # 托盘号
     if "托盘号" not in df.columns:
         for cand in ["托盘ID","托盘编号","PalletID","PalletNo","palletid","palletno"]:
             if cand in df.columns:
@@ -704,12 +590,8 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
                 break
     if "托盘号" not in df.columns:
         df["托盘号"] = pd.NA
-
-    # 仓库代码
     if "仓库代码" not in df.columns:
         df["仓库代码"] = pd.NA
-
-    # 运单号
     if "运单号" not in df.columns:
         for cand in ["Waybill","waybill","运单编号"]:
             if cand in df.columns:
@@ -722,7 +604,6 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
     df["仓库代码"] = df["仓库代码"].astype(str).str.strip()
     df["运单号"]   = df["运单号"].apply(_norm_waybill_str)
 
-    # 重量列
     weight_col = None
     for cand in ["托盘重量","托盘重","收费重","托盘收费重","计费重","计费重量","重量"]:
         if cand in df.columns:
@@ -733,12 +614,10 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
         weight_col = "托盘重量"
     df[weight_col] = pd.to_numeric(df[weight_col], errors="coerce")
 
-    # 长宽高（inch）
     len_col = next((c for c in ["托盘长","长","长度","Length","length","L"] if c in df.columns), None)
     wid_col = next((c for c in ["托盘宽","宽","宽度","Width","width","W"] if c in df.columns), None)
     hei_col = next((c for c in ["托盘高","高","高度","Height","height","H"] if c in df.columns), None)
 
-    # 箱数
     qty_col = next((c for c in [
         "箱数","箱","件数","箱件数","Packages","Package","Cartons","Carton",
         "Qty","QTY","数量"
@@ -748,7 +627,6 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
         qty_col = "箱数"
     df[qty_col] = pd.to_numeric(df[qty_col], errors="coerce")
 
-    # 体积计算（按行，使用 inch → m³）
     INCH_TO_M = 0.0254
     def _cbm_row(r):
         if not all([len_col, wid_col, hei_col]):
@@ -764,7 +642,6 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
         return None
     df["_cbm_row"] = df.apply(_cbm_row, axis=1)
 
-    # 聚合函数
     def _first_valid_num(s):
         s_num = pd.to_numeric(s, errors="coerce").dropna()
         return float(s_num.iloc[0]) if len(s_num) > 0 else None
@@ -778,7 +655,6 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
             if not _is_blank(x): return str(x).strip()
         return ""
 
-    # 创建时间列（来自 recv_app.py 提交）
     create_date_col = next((c for c in ["托盘创建日期","创建日期","PalletCreateDate","CreateDate"] if c in df.columns), None)
     create_time_col = next((c for c in ["托盘创建时间","创建时间","PalletCreateTime","CreateTime"] if c in df.columns), None)
     if create_date_col is None:
@@ -788,7 +664,6 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
         df["托盘创建时间"] = ""
         create_time_col = "托盘创建时间"
 
-    # === 先按 托盘号+仓库聚合（重量/体积/长宽高/运单清单/创建时间）===
     agg_dict = {
         "托盘重量": (weight_col, _first_valid_num),
         "托盘体积": ("_cbm_row", _first_valid_num),
@@ -805,7 +680,6 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
           .agg(**agg_dict)
     )
 
-    # === 依赖表：到仓数据表（ETA/ATA 等）、BOL成本（客户单号优先来源）===
     arrivals = arrivals_df if arrivals_df is not None else load_arrivals_df(_bust=_get_bust("arrivals"))
 
     df_join = df.merge(
@@ -822,10 +696,8 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
             if wb and cust:
                 cust_map[wb] = cust
 
-    # === 自提仓库映射（运单→自提仓库）===
     pickup_map = load_bol_pickup_map(_bust=_get_bust("bol_detail"))
 
-    # === 逐托盘构建输出行 ===
     pallets = []
     for _, brow in base.iterrows():
         pid, wh = brow["托盘号"], brow["仓库代码"]
@@ -836,22 +708,19 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
         p_vol = brow.get("托盘体积", None)
 
         waybills = brow.get("运单清单_list", []) or []
-        # 展示：运单 + 客户单号
         waybills_disp = []
         for wb in waybills:
             wb_norm = _norm_waybill_str(wb)
             cust = cust_map.get(wb_norm, "")
             disp = f"{wb}({cust})" if cust else f"{wb}"
-            disp = _normalize_ip_list_in_parens(disp)  # ✅ 仅当括号内有多个 IP 时改为空格分隔
+            disp = _normalize_ip_list_in_parens(disp)
             waybills_disp.append(disp)
 
-        # 托盘创建日期/时间
         create_date_str, create_time_str = _split_dt_to_date_time_str(
             brow.get("托盘创建日期_raw", ""),
             brow.get("托盘创建时间_raw", "")
         )
 
-        # 每个运单的箱数合计（同托盘内）
         sub_qty = df[(df["托盘号"] == pid) & (df["仓库代码"] == wh)].copy()
         sub_qty["运单号_norm"] = sub_qty["运单号"].map(_norm_waybill_str)
         qty_map = (
@@ -869,7 +738,6 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
                 q_str = str(int(q)) if abs(q - round(q)) < 1e-9 else f"{q:.2f}"
             waybills_disp_qty.append(f"{wb}({q_str})")
 
-        # 关联 ETA/ATA、ETD/ATD、承诺 & diff
         sub = df_join[(df_join["托盘号"] == pid) & (df_join["仓库代码"] == wh)]
         lines_etaata, lines_etdatd, promised = [], [], []
         diffs_days = []
@@ -900,14 +768,12 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
                     return 10**9
             diff_days_str = sorted(diffs_days, key=keyfn)[0]
 
-        # 尺寸（inch）
         L_in = brow.get("托盘长in", None)
         W_in = brow.get("托盘宽in", None)
         H_in = brow.get("托盘高in", None)
 
-        # === 自提仓库聚合 ===
         pickup_list = []
-        pickup_list_disp = []  # 展示：WB(自提仓库)
+        pickup_list_disp = []
         for wb in waybills:
             wb_norm = _norm_waybill_str(wb)
             pk = pickup_map.get(wb_norm, "")
@@ -928,7 +794,7 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
             "仓库代码": wh,
             "自提仓库(按托盘)": pallet_pickup,
             "托盘重量": float(p_wt) if pd.notna(p_wt) else None,
-            "托盘体积": float(p_vol) if p_vol is not None else None,  # m³
+            "托盘体积": float(p_vol) if p_vol is not None else None,
             "长(in)": round(float(L_in), 2) if pd.notna(L_in) else None,
             "宽(in)": round(float(W_in), 2) if pd.notna(W_in) else None,
             "高(in)": round(float(H_in), 2) if pd.notna(H_in) else None,
@@ -947,11 +813,8 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
     out = pd.DataFrame(pallets)
     if out.empty:
         return out
-
-    # 只保留有托盘号的
     out = out[out["托盘号"].astype(str).str.strip() != ""].copy()
 
-    # 数值列清洗 & 四舍五入
     for c in ["托盘体积","托盘重量","长(in)","宽(in)","高(in)"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
@@ -964,65 +827,35 @@ def load_pallet_detail_df(arrivals_df: pd.DataFrame | None = None,
 
 @st.cache_data(ttl=30)
 def load_shipped_pallet_ids(_bust=0, sheet_sig=None) -> set[str]:
-    """
-    读取『发货追踪』，返回已发托盘号集合（标准化大写去空格）。
-    """
     try:
         ws = client.open(SHEET_SHIP_TRACKING).sheet1
     except SpreadsheetNotFound:
         return set()
-
-    vals = _safe_get_all_values(
-        ws,
-        value_render_option="UNFORMATTED_VALUE",
-        date_time_render_option="SERIAL_NUMBER"
-    )
+    vals = _safe_get_all_values(ws, "UNFORMATTED_VALUE", "SERIAL_NUMBER")
     if not vals or not vals[0]:
         return set()
-
     header = list(vals[0])
     if "托盘号" not in header:
         return set()
-
     col_idx = header.index("托盘号")
     pallet_ids = [row[col_idx] for row in vals[1:] if len(row) > col_idx]
-
     def _norm_pid(s):
         return str(s).strip().upper() if s and str(s).strip() else ""
-
     return { _norm_pid(pid) for pid in pallet_ids if _norm_pid(pid) }
-
 
 @st.cache_data(ttl=300)
 def load_bol_waybill_costs(_bust=0) -> pd.DataFrame:
-    """
-    从『bol自提明细』读取并统一输出：
-      运单号 / 客户单号 / 到自提仓库日期 / 到自提仓库卡车号 / 到自提仓库费用
-    - 只保留必要列
-    - 运单号规范化
-    - 费用 -> float(两位)
-    - 日期 -> 'YYYY-MM-DD'
-    """
     try:
         ws = client.open(SHEET_BOL_DETAIL).sheet1
     except SpreadsheetNotFound:
         return pd.DataFrame(columns=["运单号","客户单号","到自提仓库日期","到自提仓库卡车号","到自提仓库费用"])
-
-    vals = _safe_get_all_values(
-        ws,
-        value_render_option="UNFORMATTED_VALUE",
-        date_time_render_option="SERIAL_NUMBER"
-    )
+    vals = _safe_get_all_values(ws, "UNFORMATTED_VALUE", "SERIAL_NUMBER")
     if not vals or not vals[0]:
         return pd.DataFrame(columns=["运单号","客户单号","到自提仓库日期","到自提仓库卡车号","到自提仓库费用"])
-
     raw_header = list(vals[0])
     df = pd.DataFrame(vals[1:], columns=raw_header) if len(vals) > 1 else pd.DataFrame(columns=raw_header)
-
-    # 别名映射
     def norm(s: str) -> str:
         return str(s).replace("\u00A0"," ").replace("\n","").replace(" ","").strip().lower()
-
     aliases = {
         "wb":   ["运单号","Waybill","waybill","运单编号","提单号","单号"],
         "cust": ["客户单号","客户PO","客户PO号","客户参考号","CustomerPO","CustomerRef","Reference","Ref","参考号"],
@@ -1030,28 +863,21 @@ def load_bol_waybill_costs(_bust=0) -> pd.DataFrame:
         "cost": ["到自提仓库费用","到自提仓费用","自提费用","BOL费用","Amount","amount","Cost","cost","费用","分摊费用"],
         "date": ["到自提仓库日期","到自提仓日期","自提日期","BOL日期","日期","Date","date","ETA(到自提仓)","ETA到自提仓库","到自提仓库ETA"],
     }
-
     def pick_col(cands: list[str]) -> str | None:
         wants = {norm(x) for x in cands}
         for h in raw_header:
             if norm(h) in wants:
                 return h
         return None
-
     col_wb    = pick_col(aliases["wb"])
     col_cust  = pick_col(aliases["cust"])
     col_truck = pick_col(aliases["truck"])
     col_cost  = pick_col(aliases["cost"])
     col_date  = pick_col(aliases["date"])
-
     if not col_wb:
         return pd.DataFrame(columns=["运单号","客户单号","到自提仓库日期","到自提仓库卡车号","到自提仓库费用"])
-
-    # 只取需要的列（存在的部分）
     need_cols = [c for c in [col_wb, col_cust, col_truck, col_cost, col_date] if c]
     df = df[need_cols].copy()
-
-    # 统一列名
     rename_map = {}
     if col_wb:    rename_map[col_wb]    = "运单号"
     if col_cust:  rename_map[col_cust]  = "客户单号"
@@ -1060,17 +886,13 @@ def load_bol_waybill_costs(_bust=0) -> pd.DataFrame:
     if col_date:  rename_map[col_date]  = "到自提仓库日期"
     df.rename(columns=rename_map, inplace=True)
 
-    # 规范化
     if "运单号" in df.columns:
         df["运单号"] = df["运单号"].map(_norm_waybill_str)
-
     if "客户单号" in df.columns:
         df["客户单号"] = df["客户单号"].astype(str).str.strip()
-
     if "到自提仓库卡车号" in df.columns:
         df["到自提仓库卡车号"] = df["到自提仓库卡车号"].astype(str).str.strip()
 
-    # 费用 -> float(两位)
     if "到自提仓库费用" in df.columns:
         def _to_num_safe_local(x):
             try:
@@ -1081,49 +903,34 @@ def load_bol_waybill_costs(_bust=0) -> pd.DataFrame:
                 return None
         df["到自提仓库费用"] = df["到自提仓库费用"].map(_to_num_safe_local)
 
-    # 日期 -> YYYY-MM-DD
     if "到自提仓库日期" in df.columns:
         df["_date_tmp"] = df["到自提仓库日期"].map(_parse_sheet_value_to_date)
         df["到自提仓库日期"] = df["_date_tmp"].map(lambda d: d.strftime("%Y-%m-%d") if isinstance(d, date) else pd.NA)
         df.drop(columns=["_date_tmp"], inplace=True, errors="ignore")
 
-    # 清理空运单 & 去重（保留最后一次）
     df = df[df["运单号"].astype(str).str.strip() != ""]
     if not df.empty:
         df = df.drop_duplicates(subset=["运单号"], keep="last")
 
-    # 保证列齐全 + 类型
     for c in ["客户单号","到自提仓库日期","到自提仓库卡车号","到自提仓库费用"]:
         if c not in df.columns:
             df[c] = pd.NA
     df["到自提仓库费用"] = pd.to_numeric(df["到自提仓库费用"], errors="coerce").round(2)
-
     return df[["运单号","客户单号","到自提仓库日期","到自提仓库卡车号","到自提仓库费用"]]
-
 
 @st.cache_data(ttl=30)
 def load_ship_tracking_raw(_bust=0, sheet_sig=None) -> pd.DataFrame:
-    """
-    读取『发货追踪』，只保留必要列并统一列名：
-      托盘号 / 运单清单 / 卡车单号 / 分摊费用 / 日期 / 自提仓库(按托盘)
-    """
     try:
         ws = client.open(SHEET_SHIP_TRACKING).sheet1
     except SpreadsheetNotFound:
         return pd.DataFrame(columns=["托盘号","运单清单","卡车单号","分摊费用","日期","自提仓库(按托盘)"])
-
-    vals = _safe_get_all_values(
-        ws,
-        value_render_option="UNFORMATTED_VALUE",
-        date_time_render_option="SERIAL_NUMBER"
-    )
+    vals = _safe_get_all_values(ws, "UNFORMATTED_VALUE", "SERIAL_NUMBER")
     if not vals or not vals[0]:
         return pd.DataFrame(columns=["托盘号","运单清单","卡车单号","分摊费用","日期","自提仓库(按托盘)"])
-
     raw_header = list(vals[0])
     df = pd.DataFrame(vals[1:], columns=raw_header) if len(vals) > 1 else pd.DataFrame(columns=raw_header)
-
-    # 别名映射：兼容不同表头
+    def norm(s: str) -> str:
+        return str(s).replace("\u00A0"," ").replace("\n","").replace(" ","").strip().lower()
     aliases = {
         "托盘号": ["托盘号","托盘编号","PalletID","Pallet","托盘"],
         "运单清单": ["运单清单","Waybills","WaybillList","运单号","Waybill"],
@@ -1132,46 +939,29 @@ def load_ship_tracking_raw(_bust=0, sheet_sig=None) -> pd.DataFrame:
         "日期":   ["日期","Date","发货日期","UploadDate"],
         "自提仓库(按托盘)": ["自提仓库(按托盘)","自提仓库","仓库","PickupWarehouse"]
     }
-
-    def norm(s: str) -> str:
-        return str(s).replace("\u00A0"," ").replace("\n","").replace(" ","").strip().lower()
-
     def pick_col(cands: list[str]) -> str | None:
         wants = {norm(x) for x in cands}
         for h in raw_header:
             if norm(h) in wants:
                 return h
         return None
-
     rename_map = {}
     for key, cands in aliases.items():
         c = pick_col(cands)
         if c:
             rename_map[c] = key
-
     df = df.rename(columns=rename_map)
-
-    # 保证列齐全
     for c in ["托盘号","运单清单","卡车单号","分摊费用","日期","自提仓库(按托盘)"]:
         if c not in df.columns:
             df[c] = pd.NA
-
-    # 类型清洗
     df["托盘号"]   = df["托盘号"].astype(str).str.strip()
     df["卡车单号"] = df["卡车单号"].astype(str).str.strip()
     df["自提仓库(按托盘)"] = df["自提仓库(按托盘)"].astype(str).str.strip()
-
-    # 分摊费用 -> float
     df["分摊费用"] = pd.to_numeric(df["分摊费用"], errors="coerce").round(2)
-
-    # 日期 -> YYYY-MM-DD
     df["_day_obj"] = df["日期"].apply(_parse_sheet_value_to_date)
     df["日期"] = df["_day_obj"].apply(lambda d: d.strftime("%Y-%m-%d") if isinstance(d, date) else "")
     df.drop(columns=["_day_obj"], inplace=True, errors="ignore")
-
-    # 清理空托盘
     df = df[df["托盘号"].astype(str).str.strip() != ""]
-
     return df[["托盘号","运单清单","卡车单号","分摊费用","日期","自提仓库(按托盘)"]]
 
 @st.cache_data(ttl=300)
@@ -1218,107 +1008,17 @@ def load_customer_refs_from_pallet(_bust=0):
     out = out[out["运单号"]!=""].drop_duplicates(subset=["运单号"])
     return out[["运单号","客户单号"]]
 
-# ===================== 运单增量构建 =====================
-def _extract_pure_waybills_and_po(mixed: str):
-    """
-    输入整段“运单清单”cell，返回 (wb_list, cust_map_from_cell)
-      - wb_list: 解析出的运单号列表（括号去掉后再判定，避免跨段）
-      - cust_map_from_cell: {wb: 第一个括号的原样内容}
-        * 注意：不判断是不是 PO；只要在该段的第一个括号里，就原样写
-    """
-    wb_list = []
-    cust_map = {}
-    if _is_blank(mixed):
-        return wb_list, cust_map
-
-    # 按中文/英文逗号、分号、顿号、竖线、斜杠等切分为“每个片段”
-    segs = re.split(r"[,\，;\；、\|/]+", str(mixed))
-    for seg in segs:
-        seg = seg.strip()
-        if not seg:
-            continue
-
-        # 1) 取第一个括号的完整内容（支持嵌套；半角优先、再全角）
-        first_paren_text = _first_balanced_paren_content(seg)
-
-        # 2) 为了找 WB：把括号内容迭代删除，再做 token 判定
-        seg_no_paren = _remove_parens_iter(seg)
-        parts = _split_tokens(seg_no_paren)
-
-        found_wb_for_this_seg = None
-        for p in parts:
-            token = _norm_waybill_str(p)
-            if not token:
-                continue
-            # 排除以 IP 开头
-            if token.upper().startswith("IP"):
-                continue
-            # 必须字母+数字且长度>=8
-            if not (re.search(r"[A-Za-z]", token) and re.search(r"\d", token) and len(token) >= 8):
-                continue
-            wb_list.append(token)
-            # 把“该段的第一个 WB”和“该段的第一个括号文本”关联起来
-            if first_paren_text and (found_wb_for_this_seg is None):
-                cust_map[token] = first_paren_text
-                found_wb_for_this_seg = token
-
-    # 去重保序
-    seen = set(); out = []
-    for wb in wb_list:
-        if wb not in seen:
-            seen.add(wb); out.append(wb)
-    return out, cust_map
-
-def _extract_pure_waybills(mixed: str) -> list[str]:
-    """
-    从《发货追踪》的“运单清单”字段中提取纯运单号列表。
-    规则保持不变：去括号内容；必须字母+数字组合且长度>=8；排除以 IP 开头的 token。
-    """
-    if _is_blank(mixed):
-        return []
-    s = str(mixed).strip()
-    # 去掉括号（含中文全角）中的注释/客户单号等信息
-    s = _RE_PARENS.sub("", s).strip()
-    if not s:
-        return []
-    parts = _split_tokens(s)
-
-    out = []
-    for p in parts:
-        token = _norm_waybill_str(p)
-        if not token:
-            continue
-        # 你的原始排除规则：IP 开头不算运单号
-        if token.upper().startswith("IP"):
-            continue
-        # 必须包含字母和数字，且长度>=8
-        if not (re.search(r"[A-Za-z]", token) and re.search(r"\d", token) and len(token) >= 8):
-            continue
-        out.append(token)
-    return out
-
-
+# ===================== 运单增量构建（修改点：只识别 USSH，客户单号仅来自『到仓数据表』） =====================
 def build_waybill_delta(track_override: pd.DataFrame | None = None):
-    """
-    聚合到“运单粒度”的增量数据。
-    优化点（对外行为不变）：
-      - 统一对 track（含 override）做强标准化 + 去重；
-      - 每行仅解析一次运单清单为 _wb_list；
-      - 先生成 wb_from_track，后续表按集合裁剪，减少数据量；
-      - 引入 wb_weight_cache，计算分摊避免重复开销。
-    """
-    # === 依赖数据 ===
     arrivals = load_arrivals_df(_bust=_get_bust("arrivals"))
     bol      = load_bol_waybill_costs(_bust=_get_bust("bol_detail"))
 
-    # ✅ 用『发货追踪』当前表签名参与缓存键，保证删/增行即时生效
     ship_track_sig = _sheet_row_sig(SHEET_SHIP_TRACKING, _bust=_get_bust("ship_tracking"))
     track = load_ship_tracking_raw(
         _bust=_get_bust("ship_tracking"),
         sheet_sig=ship_track_sig
     )
 
-    # === 合并 override（刚上传但远端未必可见的行）===
     if track_override is None:
         track_override = st.session_state.get("_track_override", None)
     if isinstance(track_override, pd.DataFrame) and not track_override.empty:
@@ -1335,7 +1035,6 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
             "发走卡车号","发走费用","自提仓库"
         ])
 
-    # === 强标准化 + 去重（托盘/卡车/日期） ===
     def _norm_pid(s):
         return str(s).strip().upper() if pd.notna(s) else ""
     def _norm_trk(s):
@@ -1350,42 +1049,25 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
     track["_trk_k"] = track.get("卡车单号","").map(_norm_trk)
     track["_day_k"] = track.get("日期","").map(_norm_day)
 
-    # 1) 先按 (托盘, 卡车, 日期) 去重
     track = track[~track.duplicated(subset=["_pid_k","_trk_k","_day_k"], keep="last")].copy()
-
-    # ✅ 1.5) 新增：同一(托盘,卡车)如仍有两条（一个空日期、一个有日期），优先保留“有日期”的那条
     track["_has_day"] = track["_day_k"].ne("")
     track = (
         track.sort_values(["_pid_k","_trk_k","_has_day"], ascending=[True, True, False])
-            .drop_duplicates(subset=["_pid_k","_trk_k"], keep="first")
-            .drop(columns=["_has_day"])
+             .drop_duplicates(subset=["_pid_k","_trk_k"], keep="first")
+             .drop(columns=["_has_day"])
     )
-
-    # 2) 兜底：对“日期仍为空”的重复，再按 (托盘, 卡车, round(分摊费用,2)) 去重
     if "分摊费用" in track.columns:
         track["_cost2"] = pd.to_numeric(track["分摊费用"], errors="coerce").round(2)
         dup2 = track["_day_k"].eq("") & track.duplicated(subset=["_pid_k","_trk_k","_cost2"], keep="last")
         track = track[~dup2].copy()
 
-
-    # === 仅解析一次“运单清单”为列表 ===
-    # === 同时解析“运单清单列表”与“第一个括号→客户单号覆盖表” ===
-    track = track.copy()
+    # ✅ 仅用严格 USSH 提取
     wb_lists = []
-    cust_override_map = {}  # {wb: 来自该段第一个括号的文本}
-
     for _, r in track.iterrows():
-        wb_list, cell_map = _extract_pure_waybills_and_po(r.get("运单清单",""))
+        wb_list = _extract_wb_ushh_only(r.get("运单清单",""))
         wb_lists.append(wb_list)
-        for k, v in (cell_map or {}).items():
-            if k and v:
-                cust_override_map[k] = v
-
     track["_wb_list"] = wb_lists
 
-
-
-    # === 汇总出本次涉及的运单集合 ===
     wb_from_track = set()
     for lst in track["_wb_list"]:
         if lst:
@@ -1400,52 +1082,43 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
             "发走卡车号","发走费用","自提仓库"
         ])
 
-    # === 只保留与本次相关的 arrivals / bol ===
     if not arrivals.empty:
         arrivals = arrivals[arrivals["运单号"].isin(wb_from_track)].copy()
     if not bol.empty:
         bol = bol[bol["运单号"].isin(wb_from_track)].copy()
 
-    # === 预备映射 ===
     weight_map = dict(zip(
         arrivals["运单号"],
         pd.to_numeric(arrivals["收费重"], errors="coerce")
     ))
 
-    # 自提仓库（运单级）映射
     pickup_map = load_bol_pickup_map(_bust=_get_bust("bol_detail"))
 
-    # === 分摊累积容器 ===
     wb2_cost: dict[str, float] = {}
     wb2_trucks: dict[str, set] = {}
     wb2_date: dict[str, date] = {}
 
-    # —— weight 缓存（避免每次 dict 取值 & 重复 sum）——
     wb_weight_cache: dict[str, float | None] = {}
     def _wb_weight(wb: str):
         if wb not in wb_weight_cache:
             wb_weight_cache[wb] = weight_map.get(wb, None)
         return wb_weight_cache[wb]
 
-    # === 遍历track行做分摊 ===
     for _, r in track.iterrows():
         waybills = [wb for wb in (r.get("_wb_list") or []) if wb in wb_from_track]
         if not waybills:
             continue
-
         pallet_cost = _to_num_safe(r.get("分摊费用"))
         truck_no    = r.get("卡车单号", "")
         dt_str      = r.get("日期", None)
         dt_obj      = _parse_sheet_value_to_date(dt_str) if not _is_blank(dt_str) else None
 
-        # 计算分摊权重
         total_w = 0.0
         weights = []
         for wb in waybills:
             w = _wb_weight(wb)
             if w and w > 0:
-                weights.append(w)
-                total_w += w
+                weights.append(w); total_w += w
             else:
                 weights.append(None)
 
@@ -1454,45 +1127,35 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
         else:
             shares = [1.0/len(waybills)] * len(waybills)
 
-        # 费用分摊
         if pallet_cost is not None:
             for wb, s in zip(waybills, shares):
                 wb2_cost[wb] = wb2_cost.get(wb, 0.0) + pallet_cost * s
 
-        # 卡车号集合
         if str(truck_no).strip():
             for wb in waybills:
                 wb2_trucks.setdefault(wb, set()).add(str(truck_no).strip())
 
-        # 发走最早日期
         if dt_obj:
             for wb in waybills:
                 if (wb not in wb2_date) or (dt_obj < wb2_date[wb]):
                     wb2_date[wb] = dt_obj
 
-    # ===== 费用一致性检查（就在这里新加）=====
     total_from_track = pd.to_numeric(track.get("分摊费用"), errors="coerce").fillna(0).sum()
     total_to_waybill = sum(wb2_cost.values())
     diff_total = round(total_from_track - total_to_waybill, 2)
-
-    # 在 Streamlit 控制台与页面同时提示（便于排查是哪一步丢了钱）
     st.write(f"🧮 费用检查：发货追踪合计={total_from_track:.2f}，已分到运单={total_to_waybill:.2f}，差额={diff_total:.2f}")
-
-    # 可选：逐车次核对（若同一 TR 有多天或多批，也能看出来是哪一车丢的）
     if "_trk_k" in track.columns:
         by_truck = (track
             .assign(_cost = pd.to_numeric(track["分摊费用"], errors="coerce").fillna(0))
             .groupby("_trk_k")["_cost"].sum())
         st.write("各卡车在『发货追踪』里的合计：", by_truck.to_dict())
-    # === 输出骨架 ===
-    out = pd.DataFrame({"运单号": sorted(wb_from_track)})
 
-    # 自提仓库（运单级）
+    out = pd.DataFrame({"运单号": sorted(wb_from_track)})
     out["自提仓库"] = out["运单号"].map(lambda wb: pickup_map.get(wb, pd.NA))
 
-    # 到仓数据对齐
+    # ✅ 到仓数据（含 客户单号）对齐（客户单号只来自这里）
     if not arrivals.empty:
-        arr2 = arrivals[["运单号","仓库代码","收费重","体积","ETD/ATD","ETA/ATA","预计到仓时间（日）"]].copy()
+        arr2 = arrivals[["运单号","仓库代码","收费重","体积","ETD/ATD","ETA/ATA","预计到仓时间（日）","客户单号"]].copy()
         arr2 = arr2.rename(columns={
             "ETD/ATD": "发出(ETD/ATD)",
             "ETA/ATA": "到港(ETA/ATA)",
@@ -1506,95 +1169,20 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
         out["发出(ETD/ATD)"] = pd.NA
         out["到港(ETA/ATA)"] = pd.NA
         out["到仓日期"]       = pd.NA
+        out["客户单号"]       = pd.NA
 
-    # ==== 客户单号优先级：cell括号(0) > BOL(1) > 托盘(2) > 到仓(3) ====
-
-    def _build_cust_priority_map(cust_override_map: dict,
-                                bol_df: pd.DataFrame,
-                                wb_from_track: set[str]) -> pd.DataFrame:
-        frames = []
-
-        # 0) 来自“运单清单 cell 第一个括号”的覆盖
-        if cust_override_map:
-            cust_from_cell = pd.DataFrame(
-                [{"运单号": wb, "客户单号": po}
-                for wb, po in cust_override_map.items()
-                if po is not None and str(po).strip() != ""]
-            )
-            if not cust_from_cell.empty:
-                cust_from_cell["_pri"] = 0
-                frames.append(cust_from_cell)
-
-        # 1) BOL
-        if bol_df is not None and not bol_df.empty and "客户单号" in bol_df.columns:
-            tmp = bol_df[["运单号","客户单号"]].copy()
-            tmp["_pri"] = 1
-            frames.append(tmp)
-
-        # 2) 托盘
-        pal = load_customer_refs_from_pallet(_bust=_get_bust("pallet_detail"))
-        if pal is not None and not pal.empty:
-            tmp = pal.copy()
-            tmp["_pri"] = 2
-            frames.append(tmp)
-
-        # 3) 到仓
-        arr = load_customer_refs_from_arrivals(_bust=_get_bust("arrivals"))
-        if arr is not None and not arr.empty:
-            tmp = arr.copy()
-            tmp["_pri"] = 3
-            frames.append(tmp)
-
-        if not frames:
-            # 返回空骨架，避免后面 KeyError
-            return pd.DataFrame(columns=["运单号","客户单号","_pri"])
-
-        cust_all = pd.concat(frames, ignore_index=True)
-
-        # 统一 & 过滤
-        cust_all["运单号"] = cust_all["运单号"].map(_norm_waybill_str)
-        cust_all["客户单号"] = cust_all["客户单号"].astype(str).str.strip()
-        cust_all = cust_all[
-            cust_all["运单号"].isin(wb_from_track) & (cust_all["客户单号"] != "")
-        ]
-
-        # 兜底：万一上面哪里漏了 _pri
-        if "_pri" not in cust_all.columns:
-            cust_all["_pri"] = 99
-
-        # 稳定排序（同运单按优先级最小保留）
-        cust_all = (cust_all
-                    .sort_values(["运单号","_pri"], kind="mergesort")
-                    .drop_duplicates(subset=["运单号"], keep="first")
-                    )[["运单号","客户单号"]]
-
-        return cust_all
-
-    # —— 在你原位置调用 —— 
-    cust_all = _build_cust_priority_map(cust_override_map, bol, wb_from_track)
-    if not cust_all.empty:
-        out = out.merge(cust_all, on="运单号", how="left")
-    else:
-        out["客户单号"] = pd.NA
-
-
-    # BOL 自提字段
     if not bol.empty:
         out = out.merge(bol[["运单号","到自提仓库日期","到自提仓库卡车号","到自提仓库费用"]], on="运单号", how="left")
     else:
         for c in ["到自提仓库日期","到自提仓库卡车号","到自提仓库费用"]:
             out[c] = pd.NA
 
-    # 发走费用 / 发走卡车号 / 发走日期
     out["发走费用"]   = out["运单号"].map(lambda wb: round(wb2_cost.get(wb, 0.0), 2) if wb in wb2_cost else pd.NA)
     out["发走卡车号"] = out["运单号"].map(lambda wb: ", ".join(sorted(wb2_trucks.get(wb, []))) if wb in wb2_trucks else pd.NA)
     def _safe_fmt_date(d):
         return _fmt_date(d) if isinstance(d, date) else pd.NA
-
     out["发走日期"] = out["运单号"].map(lambda wb: _safe_fmt_date(wb2_date.get(wb)))
 
-
-    # 数值清洗
     out["收费重"]        = pd.to_numeric(out["收费重"], errors="coerce")
     out["体积"]          = pd.to_numeric(out["体积"], errors="coerce").round(2)
     out["到自提仓库费用"]  = pd.to_numeric(out["到自提仓库费用"], errors="coerce").round(2)
@@ -1613,8 +1201,6 @@ def build_waybill_delta(track_override: pd.DataFrame | None = None):
             out[c] = pd.NA
     return out[final_cols]
 
-
-
 MANAGED_COLS = [
     "运单号","客户单号",
     "发出(ETD/ATD)","到港(ETA/ATA)","美仓备货完成日期",
@@ -1624,7 +1210,6 @@ MANAGED_COLS = [
     "仓库代码","自提仓库","收费重","体积",
     "批次ID","上传时间"
 ]
-
 
 def _is_effective(v):
     if v is None: return False
@@ -1648,16 +1233,6 @@ def _to_jsonable_cell(v):
     return v if isinstance(v, (str, int, float, bool)) else str(v)
 
 def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
-    """
-    只对 MANAGED_COLS 做“定点值更新”或“追加新行”，并加入『写入策略』保护人工修改：
-      - blank_only：仅当目标单元格为空时才写
-      - merge_set ：把新旧字符串按分隔符合并去重
-      - default   ：有有效值就写、空值不写
-
-    本版优化：
-      - 使用 _pack_ranges_for_col 把同一列的行写入压成连续 A1 区段；
-      - 用 sheets_service.spreadsheets().values().batchUpdate 分批提交
-    """
     WRITE_POLICY = {
         "到仓日期": "blank_only",
         "发走日期": "blank_only",
@@ -1688,6 +1263,7 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
             if t not in seen:
                 seen.append(t)
         return MERGE_SEP.join(seen)
+
     def _is_iso_date(s: str) -> bool:
         try:
             if not isinstance(s, str):
@@ -1697,18 +1273,13 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
         except Exception:
             return False
 
-    # --- 打开目标表 ---
     try:
         ws = client.open(SHEET_WB_SUMMARY).sheet1
     except SpreadsheetNotFound:
         st.error(f"找不到工作表「{SHEET_WB_SUMMARY}」。请先创建并在第1行写入表头（至少包含：运单号）。")
         return False
 
-    vals = _safe_get_all_values(
-        ws,
-        value_render_option="UNFORMATTED_VALUE",
-        date_time_render_option="SERIAL_NUMBER"
-    )
+    vals = _safe_get_all_values(ws, "UNFORMATTED_VALUE", "SERIAL_NUMBER")
     if not vals or not vals[0]:
         st.error("『运单全链路汇总』为空且无表头。请先在第一行写好表头（至少包含：运单号）。")
         return False
@@ -1718,20 +1289,17 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
         st.error("『运单全链路汇总』缺少“运单号”表头，无法更新。")
         return False
 
-    # --- 入参清洗 ---
     df_delta = df_delta.copy()
     if "运单号" not in df_delta.columns:
         st.error("增量数据缺少“运单号”。")
         return False
     df_delta["运单号"] = df_delta["运单号"].map(_norm_waybill_str)
 
-    # --- 补齐缺列（一次性在表头追加缺失的受管列） ---
     missing_cols = [c for c in MANAGED_COLS if c not in header]
     if missing_cols:
         ws.update(f"{ws.title}!1:1", [header + missing_cols], value_input_option="USER_ENTERED")
         header = header + missing_cols
 
-    # --- 现有表数据索引 ---
     exist_df = pd.DataFrame(vals[1:], columns=header) if len(vals) > 1 else pd.DataFrame(columns=header)
     if "运单号" not in exist_df.columns:
         exist_df["运单号"] = ""
@@ -1744,27 +1312,22 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
     common  = idx_delta.index.intersection(idx_exist.index)
     new_ids = list(idx_delta.index.difference(idx_exist.index))
 
-    # ========== 老数据“定点列更新”：构造 updates，按列压区段 ==========
     updates = []
-
     for col in MANAGED_COLS:
         if col == "运单号":
             continue
         if col not in header or col not in idx_delta.columns:
             continue
-
         col_idx = header.index(col) + 1
-        rows_payload = []  # (row_no, [value])
+        rows_payload = []
 
         policy = WRITE_POLICY.get(col, "default")
         is_date_col = col in ["到仓日期","发走日期","美仓备货完成日期","到自提仓库日期"]
 
         for wb in common:
             new_v = idx_delta.loc[wb, col]
-
-            # 日期列只允许合法 YYYY-MM-DD 字符串写入，避免 0/空 被表格格式化成 1970-01-01
             if is_date_col:
-                if not _is_iso_date(str(new_v)):
+                if not (isinstance(new_v, str) and len(new_v) == 10 and new_v.count("-")==2):
                     continue
             else:
                 if not _is_effective(new_v):
@@ -1790,11 +1353,9 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
         rows_payload.sort(key=lambda x: x[0])
         updates.extend(_pack_ranges_for_col(ws.title, col_idx, rows_payload))
 
-
-    # === 批量写入（老数据更新，分批提交更稳） ===
     if updates:
         spreadsheet_id = ws.spreadsheet.id
-        batch_sz = 300  # 每批 300 段通常比较稳
+        batch_sz = 300
         for i in range(0, len(updates), batch_sz):
             sub = updates[i:i + batch_sz]
             body = {"valueInputOption": "USER_ENTERED", "data": sub}
@@ -1803,7 +1364,6 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
                 body=body
             ).execute()
 
-    # ========== 新运单“追加新行” ==========
     if new_ids:
         cols_out = [c for c in header if c in MANAGED_COLS]
         if "运单号" not in cols_out:
@@ -1819,7 +1379,6 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
                 if c in idx_delta.columns:
                     v = idx_delta.loc[wb, c]
                     if _is_effective(v):
-                        # merge_set 策略对新行不需要合并，直接写入
                         row_dict[c] = _to_jsonable_cell(v)
             new_rows.append([row_dict.get(c, "") for c in header])
 
@@ -1828,11 +1387,9 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
 
     return True
 
-
-# ========= UI：仅启用“按托盘发货” + 「按卡车回填到仓日期」 =========
+# ========= UI =========
 st.title("🚚 发货调度")
 
-# ======= 上传按钮放大 + 高亮样式（全局）=======
 st.markdown("""
     <style>
     div.stButton > button[kind="secondary"] {
@@ -1850,7 +1407,6 @@ st.markdown("""
 tab1, tab2 = st.tabs(["按托盘发货","按卡车回填到仓日期"])
 
 with tab1:
-    # ======= 补丁C：全量刷新按钮（托盘/已发/到仓/BOL/全链路） =======
     c1,_ = st.columns([1,6])
     with c1:
         if st.button("🔄 刷新数据", key="btn_refresh_all"):
@@ -1861,11 +1417,8 @@ with tab1:
                     del st.session_state[k]
             st.rerun()
 
-
-    # 可选：先读依赖表，再注入到托盘读取，减少重复读
     arrivals_df = load_arrivals_df(_bust=_get_bust("arrivals"))
     bol_df      = load_bol_waybill_costs(_bust=_get_bust("bol_detail"))
-    # ======= 补丁D：给聚合传入 refresh_token，确保 bust 后重算 =======
     pallet_df   = load_pallet_detail_df(
         arrivals_df=arrivals_df,
         bol_cost_df=bol_df,
@@ -1882,10 +1435,7 @@ with tab1:
         st.warning("未从『托盘明细表』读取到数据，请检查表名/权限/表头。")
         st.stop()
 
-    # 取得『发货追踪』当前行数签名（10秒内变动就会触发重算）
     ship_track_sig = _sheet_row_sig(SHEET_SHIP_TRACKING, _bust=_get_bust("ship_tracking"))
-
-    # 把签名传入，确保删除/新增后，这里会重新读取
     shipped_pallets_raw = load_shipped_pallet_ids(
         _bust=_get_bust("ship_tracking"),
         sheet_sig=ship_track_sig
@@ -1895,24 +1445,20 @@ with tab1:
     pallet_df["托盘号_norm"] = pallet_df["托盘号"].astype(str).str.strip().str.upper()
     pallet_df = pallet_df[~pallet_df["托盘号_norm"].isin(shipped_pallets_norm)]
 
-
     if pallet_df.empty:
         st.info("当前可发货的托盘为空（可能都已记录在『发货追踪』）。")
         st.stop()
 
-    # ✅ 自提仓库筛选
     pk_opts = ["（全部）"] + sorted([x for x in pallet_df["自提仓库(按托盘)"].dropna().astype(str).unique() if x.strip()])
     pickup_pick = st.selectbox("选择自提仓库（可选）", options=pk_opts, key="pickup_pallet")
     if pickup_pick != "（全部）":
         pallet_df = pallet_df[pallet_df["自提仓库(按托盘)"] == pickup_pick]   
-    
-    # 仓库筛选
+
     wh_opts = ["（全部）"] + sorted([w for w in pallet_df["仓库代码"].dropna().unique() if str(w).strip()])
     wh_pick = st.selectbox("选择仓库代码（可选）", options=wh_opts, key="wh_pallet")
     if wh_pick != "（全部）":
         pallet_df = pallet_df[pallet_df["仓库代码"]==wh_pick]
 
-    # 表格与勾选
     show_cols = [
         "托盘号","仓库代码","自提仓库(按托盘)","托盘重量","长(in)","宽(in)","高(in)","托盘体积",
         "托盘创建日期","托盘创建时间",
@@ -1920,7 +1466,6 @@ with tab1:
         "对客承诺送仓时间","送仓时段差值(天)",
         "ETA/ATA(按运单)","ETD/ATD(按运单)"
     ]
-
     for c in show_cols:
         if c not in pallet_df.columns:
             pallet_df[c] = ""
@@ -1996,7 +1541,6 @@ with tab1:
                 )
                 st.caption(f"未锁定数量：{len(others_df)}")
 
-
         sel_count = int(len(selected_pal))
         sel_vol_sum = pd.to_numeric(selected_pal.get("托盘体积", pd.Series()), errors="coerce").sum()
         m1, m2 = st.columns(2)
@@ -2037,11 +1581,10 @@ with tab1:
         diff_cost = round(float(pallet_total_cost) - selected_pal["分摊费用"].sum(), 2)
 
         if abs(diff_cost) >= 0.01:
-            idx = selected_pal["分摊费用"].idxmax()  # 找到分摊费用最大的一行
+            idx = selected_pal["分摊费用"].idxmax()
             selected_pal.loc[idx, "分摊费用"] = round(
                 selected_pal.loc[idx, "分摊费用"] + diff_cost, 2
             )
-
 
         upload_df = selected_pal.copy()
         upload_df["卡车单号"] = pallet_truck_no
@@ -2060,7 +1603,6 @@ with tab1:
             "ETA/ATA(按运单)","ETD/ATD(按运单)",
             "分摊比例","分摊费用","总费用"
         ]
-
         for c in preview_cols_pal:
             if c not in upload_df.columns:
                 upload_df[c] = ""
@@ -2069,12 +1611,10 @@ with tab1:
         st.dataframe(upload_df[preview_cols_pal], use_container_width=True, height=360)
 
         st.markdown("""
-        **分摊比例计算公式：** 每个托盘的分摊比例 = 该托盘重量 ÷ 所有选中托盘重量总和  
-        **分摊费用计算公式：** 每个托盘的分摊费用 = 分摊比例 × 本车总费用  
-        （最后一托盘自动调整几分钱差额，确保总额=本车总费用）
+        **分摊比例** = 托盘重量 ÷ 所选托盘总重量  
+        **分摊费用** = 分摊比例 × 本车总费用（自动用最大项吸收几分钱差额）
         """)
 
-        # === 按钮A：仅上传到『发货追踪』 ===
         if st.button("📤 上传到『发货追踪』", key="btn_upload_pallet_upload_only"):
             try:
                 ss = client.open(SHEET_SHIP_TRACKING); ws_track = ss.sheet1
@@ -2097,7 +1637,6 @@ with tab1:
                 st.stop()
 
             tmp = upload_df.copy()
-
             _ship_date_str = ship_date_input.strftime("%Y-%m-%d")
 
             _date_header_candidates = ["日期", "发货日期", "出仓日期", "Date", "ShipDate"]
@@ -2135,7 +1674,6 @@ with tab1:
 
             tmp[pid_col_to_use] = upload_df["托盘号"].astype(str).str.strip()
 
-
             for col in header_raw:
                 if col not in tmp.columns:
                     tmp[col] = ""
@@ -2144,50 +1682,35 @@ with tab1:
             ws_track.append_rows(rows, value_input_option="USER_ENTERED")
             st.success(f"✅ 已上传 {len(rows)} 条到『{SHEET_SHIP_TRACKING}』。卡车单号：{pallet_truck_no}")
 
-
             _bust("ship_tracking")
             _ = load_ship_tracking_raw(_bust=_get_bust("ship_tracking"))
 
             st.session_state["_last_upload_pallets"] = set(upload_df["托盘号"].astype(str).str.strip())
             st.session_state["_last_upload_truck"] = str(pallet_truck_no).strip()
             st.session_state["_last_upload_at"] = datetime.now()
-            # === 覆写缓存（本地直推）：把刚上传的“托盘→发货追踪”行，保存为读取端可用的临时数据 ===
-            # === 覆写缓存（本地直推）：把刚上传的“托盘→发货追踪”行，保存为读取端可用的临时数据 ===
+
             override = upload_df[[
                 "托盘号","运单清单","自提仓库(按托盘)","分摊费用","上传发货日期（预览）","卡车单号"
             ]].copy()
-
-            # 统一列名
-            override = override.rename(columns={
-                "上传发货日期（预览）": "日期"
-            })
-
-            # 类型清洗（确保分摊费用为 float、日期为标准字符串）
-            override["托盘号"]   = override["托盘号"].astype(str).str.strip()
-            override["卡车单号"] = override["卡车单号"].astype(str).str.strip()
-
+            override = override.rename(columns={"上传发货日期（预览）": "日期"})
             def _to_float_safe(v):
                 try:
                     return float(str(v).strip())
                 except Exception:
                     return None
-
+            override["托盘号"]   = override["托盘号"].astype(str).str.strip()
+            override["卡车单号"] = override["卡车单号"].astype(str).str.strip()
             override["分摊费用"] = override["分摊费用"].map(_to_float_safe)
-
             override["日期"] = pd.to_datetime(override["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
             override["自提仓库(按托盘)"] = override["自提仓库(按托盘)"].astype(str).str.strip()
-
             st.session_state["_track_override"] = override
-
 
             st.info("下一步：点击下方“🔁 更新到『运单全链路汇总』”。")
 
-        # === 按钮B：从『发货追踪』更新/补写到『运单全链路汇总』 ===
         disable_b = not bool(st.session_state.get("_last_upload_pallets"))
         if st.button("🔁 更新到『运单全链路汇总』", key="btn_update_wb_summary", disabled=disable_b):
             needed_pids = st.session_state.get("_last_upload_pallets", set())
 
-            # ① 可见性轮询
             def _wait_visibility(max_wait_s=6.0, poll_every=0.6) -> bool:
                 start = time.time()
                 while True:
@@ -2204,16 +1727,12 @@ with tab1:
             if not visible:
                 st.info("提示：远端可能存在短暂一致性延迟，已继续尝试同步…")
 
-            # ② 构建增量并写入全链路
-            # ② 构建增量并写入全链路 —— 优先用 override（本地直推）
             try:
                 df_delta = build_waybill_delta(track_override=st.session_state.get("_track_override"))
             except Exception as e:
                 st.error(f"构建增量失败：{e}")
                 st.stop()
 
-
-            # ③ 兜底重读一次
             if df_delta.empty:
                 time.sleep(1.2)
                 _bust("ship_tracking")
@@ -2230,7 +1749,6 @@ with tab1:
                 try:
                     ok = upsert_waybill_summary_partial(df_delta)
                     if ok:
-                        # ✅ 成功写入后清理本地缓存，避免下一次重复叠加
                         if "_track_override" in st.session_state:
                             del st.session_state["_track_override"]
                         st.success("✅ 已更新到『运单全链路汇总』")
@@ -2238,9 +1756,7 @@ with tab1:
                     st.error(f"写入『运单全链路汇总』失败：{e}")
                     st.stop()
 
-
                 if ok:
-                    # ===== 补丁A：写入成功后立刻刷新并重跑，保证切到 Tab2 看到新数据 =====
                     st.session_state["_wb_updated_at"] = time.time()
                     _bust("wb_summary")
                     _ = load_waybill_summary_df(_bust=_get_bust("wb_summary"))
@@ -2249,9 +1765,7 @@ with tab1:
                 else:
                     st.warning("未能写入『运单全链路汇总』：请检查表头（需包含“运单号”）或权限。")
 
-
 with tab2:
-    # ===== 补丁B：Tab2 进入即自动拉新（30秒窗口内刚更新过全链路则强制刷新一次） =====
     if st.session_state.get("_wb_updated_at"):
         if time.time() - float(st.session_state["_wb_updated_at"]) < 30:
             _bust("wb_summary")
@@ -2312,6 +1826,7 @@ with tab2:
         if wh_pick:
             filt &= df_sum["仓库代码"].isin(wh_pick)
         if trucks_pick:
+            filt &= df_sum["_到仓日期_dt"].index.isin(df_sum[df_sum["发走卡车号"].astype(str).isin(trucks_pick)].index)
             filt &= df_sum["发走卡车号"].astype(str).isin(trucks_pick)
         if r1 and r2:
             filt &= df_sum["_发走日期_dt"].between(r1, r2)
@@ -2332,23 +1847,7 @@ with tab2:
         today = date.today()
         fill_date = st.date_input("填充到仓日期", value=today)
 
-        def _get_google_credentials():
-            if "gcp_service_account" in st.secrets:
-                sa_info = st.secrets["gcp_service_account"]
-                return Credentials.from_service_account_info(sa_info, scopes=SCOPES)
-            else:
-                return Credentials.from_service_account_file("service_accounts.json", scopes=SCOPES)
-
         def _write_arrival_date(rows_idx, date_to_fill: date):
-            """
-            将 rows_idx（1-based 的行号）对应的『到仓日期』列写入指定日期。
-            优化点：
-            - 复用全局 sheets_service（减少重复握手，降低429）
-            - 合并连续行成区段 A1
-            - 超长写入按每 500 行/批分批提交（更稳）
-            依赖：外层已有 ws_sum、header_raw（就是 load_waybill_summary_df 返回的）
-            """
-            # 1) 找到『到仓日期』列的 1-based 列号
             col_idx_1based = None
             for i, h in enumerate(header_raw):
                 hn = str(h).replace(" ", "")
@@ -2358,12 +1857,8 @@ with tab2:
             if col_idx_1based is None:
                 st.error("目标表缺少『到仓日期』列。请先在表头新增该列后重试。")
                 return False
-
-            # 空集合直接返回
             if not rows_idx:
                 return True
-
-            # 2) 规范化并排序行号
             try:
                 rows = sorted(int(r) for r in rows_idx if r is not None)
             except Exception:
@@ -2372,7 +1867,6 @@ with tab2:
             if not rows:
                 return True
 
-            # 3) 合并连续行段 -> [(start_row, end_row), ...]
             ranges = []
             s = p = rows[0]
             for r in rows[1:]:
@@ -2383,7 +1877,6 @@ with tab2:
                     s = p = r
             ranges.append((s, p))
 
-            # 4) 组装 batchUpdate payload（每段一个 range，values 为逐行同值）
             sheet_title = ws_sum.title
             spreadsheet_id = ws_sum.spreadsheet.id
             date_str = date_to_fill.strftime("%Y-%m-%d")
@@ -2399,7 +1892,6 @@ with tab2:
 
             updates = [_mk_update_for_segment(r1, r2) for (r1, r2) in ranges]
 
-            # 5) 分批发送（每 500 段/批通常很稳；若单段很长也没关系）
             try:
                 batch_size = 500
                 for i in range(0, len(updates), batch_size):
@@ -2416,7 +1908,6 @@ with tab2:
             except Exception as e:
                 st.error(f"写入失败：{e}")
                 return False
-
 
         left, right = st.columns([1,1])
         with left:
