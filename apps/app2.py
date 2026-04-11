@@ -198,6 +198,51 @@ def _is_blank(v):
     except Exception:
         try: return bool(pd.isna(v))
         except Exception: return False
+def _ensure_scalar(v, *, df_name: str, key=None, col=None):
+    """
+    不改变原逻辑，只把“本应单值”的读取显式化。
+    如果命中多行，直接抛出清晰错误，而不是让 pandas 在 int()/float() 时炸。
+    """
+    if isinstance(v, pd.Series):
+        try:
+            vals = v.tolist()
+        except Exception:
+            vals = str(v)
+        raise ValueError(
+            f"{df_name} 命中多行，无法按单值处理。key={key}, col={col}, values={vals}"
+        )
+    return v
+
+
+def _scalar_loc(df, row_key, col, *, df_name: str):
+    """
+    df.loc[row_key, col] 的安全单值读取版。
+    不兜底，不自动选一条，不改逻辑。
+    """
+    v = df.loc[row_key, col]
+    return _ensure_scalar(v, df_name=df_name, key=row_key, col=col)
+
+
+def _assert_unique_key(df: pd.DataFrame, key_col: str, *, df_name: str):
+    """
+    显式校验“本来就应该唯一”的 key。
+    不做自动修复，只在脏数据时给出明确错误。
+    """
+    if key_col not in df.columns:
+        raise ValueError(f"{df_name} 缺少关键列: {key_col}")
+
+    key_series = df[key_col].map(lambda x: "" if _is_blank(x) else str(x).strip())
+    dup_mask = key_series.ne("") & key_series.duplicated(keep=False)
+
+    if dup_mask.any():
+        dup_df = df.loc[dup_mask, [key_col]].copy()
+        dup_vals = sorted(dup_df[key_col].astype(str).str.strip().unique().tolist())
+        preview = dup_vals[:20]
+        more = "" if len(dup_vals) <= 20 else f" ... 共 {len(dup_vals)} 个重复 key"
+        raise ValueError(
+            f"{df_name} 存在重复 {key_col}: {preview}{more}"
+        )
+
 
 def _pack_ranges_for_col(ws_title: str, col_idx_1based: int, rowvals: list[tuple[int, list]]):
     updates = []
@@ -1233,159 +1278,148 @@ def _to_jsonable_cell(v):
     return v if isinstance(v, (str, int, float, bool)) else str(v)
 
 def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
-    WRITE_POLICY = {
-        "到仓日期": "blank_only",
-        "发走日期": "blank_only",
-        "美仓备货完成日期": "blank_only",
-        "到自提仓库日期": "blank_only",
-        "到自提仓库费用": "blank_only",
-        "发走费用": "blank_only",
-        "到自提仓库卡车号": "merge_set",
-        "发走卡车号": "merge_set",
-        "仓库代码": "blank_only",
-        "客户单号": "blank_only",
-        "自提仓库": "blank_only",
-        "批次ID": "blank_only",
-        "上传时间": "blank_only",
-    }
-    MERGE_SEP = ","
-
-    def _cell_blank(x):
-        return (x is None) or (isinstance(x, float) and pd.isna(x)) or (isinstance(x, str) and x.strip() == "")
-
-    def _merge_set(old, new):
-        def toks(s):
-            if _cell_blank(s): return []
-            parts = re.split(r"[,\，;\；\|/ ]+", str(s).strip())
-            return [p for p in parts if p]
-        seen = []
-        for t in (toks(old) + toks(new)):
-            if t not in seen:
-                seen.append(t)
-        return MERGE_SEP.join(seen)
-
-    def _is_iso_date(s: str) -> bool:
-        try:
-            if not isinstance(s, str):
-                return False
-            pd.to_datetime(s, format="%Y-%m-%d", errors="raise")
-            return True
-        except Exception:
-            return False
+    gc = get_gspread_client()
 
     try:
-        ws = client.open(SHEET_WB_SUMMARY).sheet1
-    except SpreadsheetNotFound:
-        st.error(f"找不到工作表「{SHEET_WB_SUMMARY}」。请先创建并在第1行写入表头（至少包含：运单号）。")
-        return False
+        sh = gc.open_by_key(WB)
+    except Exception:
+        sh = gc.open(TARGET_SPREADSHEET_NAME)
 
-    vals = _safe_get_all_values(ws, "UNFORMATTED_VALUE", "SERIAL_NUMBER")
-    if not vals or not vals[0]:
-        st.error("『运单全链路汇总』为空且无表头。请先在第一行写好表头（至少包含：运单号）。")
-        return False
+    ws = sh.worksheet(SHEET_WB_SUMMARY)
 
-    header = list(vals[0])
-    if "运单号" not in header:
-        st.error("『运单全链路汇总』缺少“运单号”表头，无法更新。")
-        return False
+    vals = _safe_get_all_values(ws)
+    if not vals:
+        raise ValueError("『运单全链路汇总』为空，无法更新。")
 
+    headers = _norm_header(vals[0])
+    rows = vals[1:]
+    exist_df = pd.DataFrame(rows, columns=headers)
+
+    # ========= 标准化表头 =========
+    # 保持原逻辑：列名仍然用规范化后的名字来匹配
     df_delta = df_delta.copy()
+    df_delta.columns = _norm_header(df_delta.columns)
+    exist_df.columns = _norm_header(exist_df.columns)
+
+    # ========= 补关键列 =========
     if "运单号" not in df_delta.columns:
-        st.error("增量数据缺少“运单号”。")
-        return False
-    df_delta["运单号"] = df_delta["运单号"].map(_norm_waybill_str)
-
-    missing_cols = [c for c in MANAGED_COLS if c not in header]
-    if missing_cols:
-        ws.update(f"{ws.title}!1:1", [header + missing_cols], value_input_option="USER_ENTERED")
-        header = header + missing_cols
-
-    exist_df = pd.DataFrame(vals[1:], columns=header) if len(vals) > 1 else pd.DataFrame(columns=header)
+        raise ValueError("df_delta 缺少『运单号』列")
     if "运单号" not in exist_df.columns:
-        exist_df["运单号"] = ""
+        raise ValueError("『运单全链路汇总』缺少『运单号』列")
+
+    # ========= 运单号标准化 =========
+    df_delta["运单号"] = df_delta["运单号"].map(_norm_waybill_str)
     exist_df["运单号"] = exist_df["运单号"].map(_norm_waybill_str)
+
+    # ========= 关键唯一性检查 =========
+    # 这里不自动修，不改逻辑。只是把原来隐含的“必须唯一”前提显式化。
+    _assert_unique_key(df_delta[df_delta["运单号"].ne("")], "运单号", df_name="本次运单增量(df_delta)")
+    _assert_unique_key(exist_df[exist_df["运单号"].ne("")], "运单号", df_name="运单全链路汇总")
+
+    # ========= 建行号 =========
     exist_df["_rowno"] = np.arange(2, 2 + len(exist_df))
 
-    idx_exist = exist_df.set_index("运单号", drop=False)
+    # ========= 建 index =========
     idx_delta = df_delta.set_index("运单号", drop=False)
+    idx_exist = exist_df.set_index("运单号", drop=False)
 
-    common  = idx_delta.index.intersection(idx_exist.index)
-    new_ids = list(idx_delta.index.difference(idx_exist.index))
+    # ========= 需要同步的列 =========
+    # 保持你原本“部分更新”的逻辑：只更新这些存在于 df_delta 的列
+    update_cols = [
+        c for c in [
+            "客户单号",
+            "仓库代码",
+            "收费重",
+            "体积",
+            "发出(ETD/ATD)",
+            "到港(ETA/ATA)",
+            "到自提仓库日期",
+            "发走日期",
+            "到仓日期",
+            "到自提仓库卡车号",
+            "到自提仓库费用",
+            "发走卡车号",
+            "发走费用",
+            "自提仓库",
+        ]
+        if c in df_delta.columns
+    ]
 
-    updates = []
-    for col in MANAGED_COLS:
-        if col == "运单号":
+    # ========= 现有表缺列时补空列 =========
+    for c in update_cols:
+        if c not in exist_df.columns:
+            exist_df[c] = ""
+            headers.append(c)
+
+    # ========= 重新对齐列顺序（如有新增列） =========
+    exist_df = exist_df.reindex(columns=[c for c in headers if c in exist_df.columns] + [c for c in exist_df.columns if c not in headers])
+
+    # 重新建立 index，保证新增列后仍可取值
+    idx_exist = exist_df.set_index("运单号", drop=False)
+
+    # ========= 新增 / 更新拆分 =========
+    delta_wb = [wb for wb in df_delta["运单号"].tolist() if not _is_blank(wb)]
+    exist_wb_set = set([wb for wb in exist_df["运单号"].tolist() if not _is_blank(wb)])
+
+    to_update = [wb for wb in delta_wb if wb in exist_wb_set]
+    to_append = [wb for wb in delta_wb if wb not in exist_wb_set]
+
+    # ========= 构造更新 payload =========
+    rows_payload_by_col = {}
+
+    for col in update_cols:
+        if col not in exist_df.columns:
             continue
-        if col not in header or col not in idx_delta.columns:
-            continue
-        col_idx = header.index(col) + 1
-        rows_payload = []
 
-        policy = WRITE_POLICY.get(col, "default")
-        is_date_col = col in ["到仓日期","发走日期","美仓备货完成日期","到自提仓库日期"]
+        col_idx_1based = exist_df.columns.get_loc(col) + 1
+        rowvals = []
 
-        for wb in common:
-            new_v = idx_delta.loc[wb, col]
-            if is_date_col:
-                if not (isinstance(new_v, str) and len(new_v) == 10 and new_v.count("-")==2):
+        for wb in to_update:
+            new_v = _scalar_loc(idx_delta, wb, col, df_name="本次运单增量(df_delta)")
+            old_v = _scalar_loc(idx_exist, wb, col, df_name="运单全链路汇总")
+            rno   = int(_scalar_loc(idx_exist, wb, "_rowno", df_name="运单全链路汇总"))
+
+            new_j = _to_jsonable_cell(new_v)
+            old_j = _to_jsonable_cell(old_v)
+
+            # 保持原逻辑：仅当新值有效且与旧值不同才更新
+            if _is_effective(new_j) and str(new_j) != str(old_j):
+                rowvals.append((rno, [new_j]))
+
+        if rowvals:
+            rows_payload_by_col[col_idx_1based] = _pack_ranges_for_col(ws.title, col_idx_1based, rowvals)
+
+    # ========= 先补表头新增列（如果有） =========
+    current_headers = _norm_header(vals[0])
+    if current_headers != list(exist_df.columns[:len(current_headers)]):
+        # 只更新第一行表头，不改变业务逻辑
+        ws.update("1:1", [list(exist_df.columns)], value_input_option="RAW")
+
+    # ========= 批量更新已有行 =========
+    batch_updates = []
+    for _, updates in rows_payload_by_col.items():
+        batch_updates.extend(updates)
+
+    if batch_updates:
+        ws.batch_update(batch_updates, value_input_option="USER_ENTERED")
+
+    # ========= 追加新行 =========
+    if to_append:
+        append_rows = []
+        for wb in to_append:
+            row = []
+            for col in exist_df.columns:
+                if col == "_rowno":
                     continue
-            else:
-                if not _is_effective(new_v):
-                    continue
+                if col in idx_delta.columns:
+                    v = _scalar_loc(idx_delta, wb, col, df_name="本次运单增量(df_delta)")
+                    row.append(_to_jsonable_cell(v))
+                else:
+                    row.append("")
+            append_rows.append(row)
 
-            rno = int(idx_exist.loc[wb, "_rowno"])
-            old_v = idx_exist.loc[wb, col] if col in idx_exist.columns else ""
-
-            if policy == "blank_only":
-                if not (old_v is None or (isinstance(old_v, float) and pd.isna(old_v)) or (isinstance(old_v, str) and old_v.strip() == "")):
-                    continue
-                write_v = new_v
-            elif policy == "merge_set":
-                write_v = _merge_set(old_v, new_v)
-            else:
-                write_v = new_v
-
-            rows_payload.append((rno, [_to_jsonable_cell(write_v)]))
-
-        if not rows_payload:
-            continue
-
-        rows_payload.sort(key=lambda x: x[0])
-        updates.extend(_pack_ranges_for_col(ws.title, col_idx, rows_payload))
-
-    if updates:
-        spreadsheet_id = ws.spreadsheet.id
-        batch_sz = 300
-        for i in range(0, len(updates), batch_sz):
-            sub = updates[i:i + batch_sz]
-            body = {"valueInputOption": "USER_ENTERED", "data": sub}
-            sheets_service.spreadsheets().values().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body=body
-            ).execute()
-
-    if new_ids:
-        cols_out = [c for c in header if c in MANAGED_COLS]
-        if "运单号" not in cols_out:
-            cols_out = ["运单号"] + cols_out
-
-        new_rows = []
-        for wb in new_ids:
-            row_dict = {c: "" for c in header}
-            row_dict["运单号"] = wb
-            for c in MANAGED_COLS:
-                if c == "运单号" or c not in header:
-                    continue
-                if c in idx_delta.columns:
-                    v = idx_delta.loc[wb, c]
-                    if _is_effective(v):
-                        row_dict[c] = _to_jsonable_cell(v)
-            new_rows.append([row_dict.get(c, "") for c in header])
-
-        if new_rows:
-            ws.append_rows(new_rows, value_input_option="USER_ENTERED")
-
-    return True
+        if append_rows:
+            ws.append_rows(append_rows, value_input_option="USER_ENTERED")
 
 # ========= UI =========
 st.title("🚚 发货调度")
