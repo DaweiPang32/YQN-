@@ -1277,44 +1277,68 @@ def _to_jsonable_cell(v):
         return "" if (math.isnan(v) or math.isinf(v)) else v
     return v if isinstance(v, (str, int, float, bool)) else str(v)
 
-def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
+def upsert_waybill_summary_partial(df_delta: pd.DataFrame) -> bool:
     gc = get_gspread_client()
 
+    # —— 打开『运单全链路汇总』——
     try:
-        sh = gc.open_by_key(WB)
-    except Exception:
-        sh = gc.open(TARGET_SPREADSHEET_NAME)
+        sh = gc.open(SHEET_WB_SUMMARY)
+    except SpreadsheetNotFound:
+        st.error(f"找不到工作表「{SHEET_WB_SUMMARY}」。")
+        return False
+    except Exception as e:
+        st.error(f"打开『{SHEET_WB_SUMMARY}』失败：{e}")
+        return False
 
-    ws = sh.worksheet(SHEET_WB_SUMMARY)
+    ws = sh.sheet1
 
-    vals = _safe_get_all_values(ws)
+    # —— 读现有数据 ——
+    try:
+        vals = _safe_get_all_values(ws)
+    except Exception as e:
+        st.error(f"读取『{SHEET_WB_SUMMARY}』失败：{e}")
+        return False
+
     if not vals:
-        raise ValueError("『运单全链路汇总』为空，无法更新。")
+        st.error("『运单全链路汇总』为空，无法更新（至少需要表头）。")
+        return False
 
     headers = _norm_header(vals[0])
     rows = vals[1:]
     exist_df = pd.DataFrame(rows, columns=headers)
 
     # ========= 标准化表头 =========
-    # 保持原逻辑：列名仍然用规范化后的名字来匹配
     df_delta = df_delta.copy()
     df_delta.columns = _norm_header(df_delta.columns)
     exist_df.columns = _norm_header(exist_df.columns)
 
     # ========= 补关键列 =========
     if "运单号" not in df_delta.columns:
-        raise ValueError("df_delta 缺少『运单号』列")
+        st.error("df_delta 缺少『运单号』列")
+        return False
     if "运单号" not in exist_df.columns:
-        raise ValueError("『运单全链路汇总』缺少『运单号』列")
+        st.error("『运单全链路汇总』缺少『运单号』列")
+        return False
 
     # ========= 运单号标准化 =========
     df_delta["运单号"] = df_delta["运单号"].map(_norm_waybill_str)
     exist_df["运单号"] = exist_df["运单号"].map(_norm_waybill_str)
 
     # ========= 关键唯一性检查 =========
-    # 这里不自动修，不改逻辑。只是把原来隐含的“必须唯一”前提显式化。
-    _assert_unique_key(df_delta[df_delta["运单号"].ne("")], "运单号", df_name="本次运单增量(df_delta)")
-    _assert_unique_key(exist_df[exist_df["运单号"].ne("")], "运单号", df_name="运单全链路汇总")
+    try:
+        _assert_unique_key(
+            df_delta[df_delta["运单号"].ne("")],
+            "运单号",
+            df_name="本次运单增量(df_delta)"
+        )
+        _assert_unique_key(
+            exist_df[exist_df["运单号"].ne("")],
+            "运单号",
+            df_name="运单全链路汇总"
+        )
+    except ValueError as e:
+        st.error(str(e))
+        return False
 
     # ========= 建行号 =========
     exist_df["_rowno"] = np.arange(2, 2 + len(exist_df))
@@ -1324,7 +1348,6 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
     idx_exist = exist_df.set_index("运单号", drop=False)
 
     # ========= 需要同步的列 =========
-    # 保持你原本“部分更新”的逻辑：只更新这些存在于 df_delta 的列
     update_cols = [
         c for c in [
             "客户单号",
@@ -1346,13 +1369,18 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
     ]
 
     # ========= 现有表缺列时补空列 =========
+    new_cols_added = False
     for c in update_cols:
         if c not in exist_df.columns:
             exist_df[c] = ""
             headers.append(c)
+            new_cols_added = True
 
-    # ========= 重新对齐列顺序（如有新增列） =========
-    exist_df = exist_df.reindex(columns=[c for c in headers if c in exist_df.columns] + [c for c in exist_df.columns if c not in headers])
+    # 重新对齐列顺序（如有新增列）
+    exist_df = exist_df.reindex(
+        columns=[c for c in headers if c in exist_df.columns]
+                + [c for c in exist_df.columns if c not in headers]
+    )
 
     # 重新建立 index，保证新增列后仍可取值
     idx_exist = exist_df.set_index("运单号", drop=False)
@@ -1375,25 +1403,33 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
         rowvals = []
 
         for wb in to_update:
-            new_v = _scalar_loc(idx_delta, wb, col, df_name="本次运单增量(df_delta)")
-            old_v = _scalar_loc(idx_exist, wb, col, df_name="运单全链路汇总")
-            rno   = int(_scalar_loc(idx_exist, wb, "_rowno", df_name="运单全链路汇总"))
+            try:
+                new_v = _scalar_loc(idx_delta, wb, col, df_name="本次运单增量(df_delta)")
+                old_v = _scalar_loc(idx_exist, wb, col, df_name="运单全链路汇总")
+                rno   = int(_scalar_loc(idx_exist, wb, "_rowno", df_name="运单全链路汇总"))
+            except ValueError as e:
+                st.error(str(e))
+                return False
 
             new_j = _to_jsonable_cell(new_v)
             old_j = _to_jsonable_cell(old_v)
 
-            # 保持原逻辑：仅当新值有效且与旧值不同才更新
+            # 仅当新值有效且与旧值不同才更新
             if _is_effective(new_j) and str(new_j) != str(old_j):
                 rowvals.append((rno, [new_j]))
 
         if rowvals:
-            rows_payload_by_col[col_idx_1based] = _pack_ranges_for_col(ws.title, col_idx_1based, rowvals)
+            rows_payload_by_col[col_idx_1based] = _pack_ranges_for_col(
+                ws.title, col_idx_1based, rowvals
+            )
 
     # ========= 先补表头新增列（如果有） =========
-    current_headers = _norm_header(vals[0])
-    if current_headers != list(exist_df.columns[:len(current_headers)]):
-        # 只更新第一行表头，不改变业务逻辑
-        ws.update("1:1", [list(exist_df.columns)], value_input_option="RAW")
+    if new_cols_added:
+        try:
+            ws.update("1:1", [list(exist_df.columns)], value_input_option="RAW")
+        except Exception as e:
+            st.error(f"更新表头失败：{e}")
+            return False
 
     # ========= 批量更新已有行 =========
     batch_updates = []
@@ -1401,7 +1437,11 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
         batch_updates.extend(updates)
 
     if batch_updates:
-        ws.batch_update(batch_updates, value_input_option="USER_ENTERED")
+        try:
+            ws.batch_update(batch_updates, value_input_option="USER_ENTERED")
+        except Exception as e:
+            st.error(f"批量更新已有行失败：{e}")
+            return False
 
     # ========= 追加新行 =========
     if to_append:
@@ -1412,14 +1452,24 @@ def upsert_waybill_summary_partial(df_delta: pd.DataFrame):
                 if col == "_rowno":
                     continue
                 if col in idx_delta.columns:
-                    v = _scalar_loc(idx_delta, wb, col, df_name="本次运单增量(df_delta)")
+                    try:
+                        v = _scalar_loc(idx_delta, wb, col, df_name="本次运单增量(df_delta)")
+                    except ValueError as e:
+                        st.error(str(e))
+                        return False
                     row.append(_to_jsonable_cell(v))
                 else:
                     row.append("")
             append_rows.append(row)
 
         if append_rows:
-            ws.append_rows(append_rows, value_input_option="USER_ENTERED")
+            try:
+                ws.append_rows(append_rows, value_input_option="USER_ENTERED")
+            except Exception as e:
+                st.error(f"追加新行失败：{e}")
+                return False
+
+    return True
 
 # ========= UI =========
 st.title("🚚 发货调度")
